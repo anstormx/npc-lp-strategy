@@ -27,7 +27,7 @@ export class OracleService {
       chainId: config.chainId,
       name: 'base'
     });
-    this.token0 = config.tokens.ETH;
+    this.token0 = config.tokens.WETH;
     this.token1 = config.tokens.USDC;
     this.poolFee = config.uniswap.poolFee;
     

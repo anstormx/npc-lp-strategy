@@ -16,16 +16,26 @@ if (!process.env.RPC_URL) {
   process.exit(1);
 }
 
+if (!process.env.MONGO_URI) {
+    console.error('MONGO_URI environment variable is required');
+    process.exit(1);
+}
+
 // Initialize the strategy controller with the Base mainnet config
 const privateKey = process.env.PRIVATE_KEY;
+const mongoUri = process.env.MONGO_URI;
 
 // Start the strategy
 async function main() {
   try {
-    const strategy = new CustomPoolStrategy(baseMainnet, privateKey);
+    // Initialize strategy with MongoDB if URI is provided
+    const strategy = new CustomPoolStrategy(
+      baseMainnet, 
+      privateKey,
+      mongoUri
+    );
 
     console.log(`NPC LP Strategy for WETH/USDC on Base Mainnet`);
-    console.log('Strategy Cycle: WETH → USDC → WETH → ...');
 
     // Initialize services
     await strategy.initialize();

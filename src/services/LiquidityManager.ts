@@ -2,7 +2,6 @@ import { Contract, ethers, BigNumber } from 'ethers';
 import { NetworkConfig, PositionInfo } from '../utils/types';
 import NonfungiblePositionManagerABI from '../contracts/abis/INonfungiblePositionManager.json';
 import IERC20ABI from '../contracts/abis/IERC20.json';
-import WETHABI from '../contracts/abis/IWETH.json';
 import { OracleService } from './OracleService';
 import { PoolManager } from './PoolManager';
 
@@ -39,7 +38,7 @@ export class LiquidityManager {
     this.token1 = config.tokens.USDC;
 
     // Initialize token contracts
-    this.token0Contract = new ethers.Contract(this.token0, WETHABI, this.signer); // maybe IERC20ABI
+    this.token0Contract = new ethers.Contract(this.token0, IERC20ABI, this.signer);
     this.token1Contract = new ethers.Contract(this.token1, IERC20ABI, this.signer);
 
     console.log(`
@@ -115,11 +114,14 @@ export class LiquidityManager {
     }
 
     // Print position parameters
-    console.log(`Minting new position with:
-      Tick Range: [${tickLower}, ${tickUpper}]
-      Token0 Amount: ${ethers.utils.formatEther(amount0Desired)}
-      Token1 Amount: ${ethers.utils.formatUnits(amount1Desired, 6)}
-      Mode: MAINNET
+    console.log(`
+      --------------------------------
+        Minting new position with:
+        Tick Range: [${tickLower}, ${tickUpper}]
+        Token0 Amount: ${ethers.utils.formatEther(amount0Desired)}
+        Token1 Amount: ${ethers.utils.formatUnits(amount1Desired, 6)}
+        Mode: MAINNET
+      --------------------------------
     `);
 
     // Real implementation for mainnet
@@ -127,7 +129,7 @@ export class LiquidityManager {
       // Approve tokens for position manager
       await this.approveTokens(amount0Desired, amount1Desired);
 
-      // Set deadline to 20 minutes from now (increased from 10 minutes)
+      // Set deadline to 20 minutes from now
       const deadline = Math.floor(Date.now() / 1000) + 1200;
 
       // Calculate minimum amounts with 2% slippage protection if not specified
@@ -631,5 +633,35 @@ export class LiquidityManager {
     }
     
     return price;
+  }
+
+  /**
+   * Gets all positions owned by the user
+   * @returns Array of position information
+   */
+  public async getUserPositions(): Promise<any[]> {
+    console.log(`Getting positions for user: ${this.walletAddress}`);
+    
+    try {
+      // Get the balance of position NFTs for this user
+      const balance = await this.positionManager.balanceOf(this.walletAddress);
+      
+      // Get each position token ID
+      const positions = [];
+      for (let i = 0; i < balance; i++) {
+        const tokenId = await this.positionManager.tokenOfOwnerByIndex(this.walletAddress, i);
+        console.log(`Found position token ID: ${tokenId}`);
+        
+        // Get position details
+        const position = await this.getPositionInfo(tokenId);
+        positions.push(position);
+      }
+      
+      console.log(`Retrieved ${positions.length} positions`);
+      return positions;
+    } catch (error) {
+      console.error('Error getting user positions:', error);
+      return [];
+    }
   }
 } 

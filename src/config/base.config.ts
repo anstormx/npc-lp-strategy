@@ -1,29 +1,36 @@
+import { NetworkConfig } from '../utils/types';
 import dotenv from 'dotenv';
 dotenv.config();
 
-export default {
-  chainId: 8453, // Base mainnet chainId
-  rpcUrl: process.env.RPC_URL,
+const rpcUrl = process.env.RPC_URL;
+
+if (!rpcUrl) {
+  throw new Error('RPC_URL is not defined in the environment variables');
+}
+
+const baseMainnet: NetworkConfig = {
+  network: 'base',
+  rpcUrl: rpcUrl,
+  chainId: 8453,
   tokens: {
-    WETH: "0x4200000000000000000000000000000000000006", // WETH on Base mainnet
-    USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" // USDC on Base mainnet
+    WETH: '0x4200000000000000000000000000000000000006',
+    USDC: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   },
   uniswap: {
-    positionManager: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1", // Uniswap V3 NonfungiblePositionManager on Base mainnet
-    swapRouter: "0x2626664c2603336E57B271c5C0b26F421741e481", // Uniswap V3 SwapRouter on Base mainnet
-    factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", // Uniswap V3 Factory on Base mainnet
-    poolFee: 3000, // 0.30% fee tier (default)
-    feeTiers: [500, 3000, 10000], // Available fee tiers: 0.05%, 0.3%, 1%
+    poolFee: 3000, // 0.3%
+    swapRouter: '0x2626664c2603336E57B271c5C0b26F421741e481',
+    positionManager: '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1',
+    factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
+    feeTiers: [500, 3000, 10000],
   },
   strategy: {
-    checkInterval: 5,
-    rangeWidthPercent: 5,
+    checkInterval: 60000, // Check every minute
     slippagePercent: 0.5,
-    binanceSymbol: "ETHUSDT",
+    tickRange: 2, // Tick range for NPC LP strategy
     positionStep: 1,
     rebalanceThreshold: 0.5,
     maxTickDeviation: 45,
-    cycleStepDelay: 3600,
-    dynamicFeeTier: false
-  }
-}; 
+  },
+};
+
+export default baseMainnet; 
