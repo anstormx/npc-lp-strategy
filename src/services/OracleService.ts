@@ -1,8 +1,7 @@
 import axios from 'axios';
 import { Contract, ethers, BigNumber } from 'ethers';
-import { PriceData, NetworkConfig, StrategyStep, PositionRangeParams, PoolCreationParams } from '../utils/types';
-import IUniswapV3Pool from '@uniswap/v3-core/artifacts/contracts/interfaces/IUniswapV3Pool.sol/IUniswapV3Pool.json';
-import IUniswapV3FactoryABI from '../contracts/abis/IUniswapV3Factory.json';
+import { PriceData, NetworkConfig, StrategyStep, PositionRangeParams } from '../utils/types';
+import IUniswapV3Pool from '../contracts/abis/IUniswapV3Pool.json';
 import { PoolManager } from './PoolManager';
 
 /**
@@ -21,7 +20,8 @@ export class OracleService {
 
   constructor(
     private config: NetworkConfig,
-    private privateKey?: string
+    private privateKey: string,
+    private PoolManager: PoolManager
   ) {
     this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl, {
       chainId: config.chainId,
@@ -29,12 +29,9 @@ export class OracleService {
     });
     this.token0 = config.tokens.WETH;
     this.token1 = config.tokens.USDC;
-    this.poolFee = config.uniswap.poolFee;
-    
-    // Initialize the pool manager if private key is provided
-    if (privateKey) {
-      this.poolManager = new PoolManager(config, privateKey);
-    }
+    // Use default fee value of 3000 (0.3%) instead of accessing config
+    this.poolFee = 3000;
+    this.poolManager = PoolManager;    
     
     // Set default tick spacing based on pool fee (will be updated from contract when initialized)
     if (this.poolFee === 500) {
@@ -47,12 +44,11 @@ export class OracleService {
 
     console.log(`
       --------------------------------
-      Oracle Service initialized:
+      Oracle Service constructor:
       Token0: ${this.token0}
       Token1: ${this.token1}
-      Fee: ${this.poolFee}
-      Tick spacing: ${this.tickSpacing}
-      Pool address: ${this.poolAddress}
+      Default Fee: ${this.poolFee}
+      Default Tick spacing: ${this.tickSpacing}
       --------------------------------
     `);
   }
@@ -69,24 +65,114 @@ export class OracleService {
     this.token1 = await this.poolContract.token1();
     
     // Get fee and update tickSpacing
-    this.poolFee = Number(await this.poolContract.fee());
+    await this.fetchPoolFeeFromContract();
     
     // Set appropriate tick spacing
     try {
       this.tickSpacing = await this.poolContract.tickSpacing();
       console.log(`Tick spacing fetched from contract: ${this.tickSpacing}`);
     } catch (error) {
-      throw new Error('Failed to fetch tick spacing from contract');
+      // If tickSpacing method not available, set based on fee
+      this.updateTickSpacingFromFee();
+      console.log(`Using tick spacing calculated from fee: ${this.tickSpacing}`);
     }
 
-    console.log("--------------------------------");
-    console.log(`PoolManager: ${this.poolManager}`);
-    console.log(`Oracle initialized with pool: ${this.poolAddress}`);
-    console.log(`Token0: ${this.token0}`);
-    console.log(`Token1: ${this.token1}`);
-    console.log(`Fee: ${this.poolFee}`);
-    console.log(`Tick spacing: ${this.tickSpacing}`);
-    console.log("--------------------------------");
+    console.log(`
+      --------------------------------
+      Oracle Service initialized:
+      Token0: ${this.token0}
+      Token1: ${this.token1}
+      Fee: ${this.poolFee}
+      Tick spacing: ${this.tickSpacing}
+      --------------------------------
+    `);
+  }
+
+  /**
+   * Fetch pool fee from the currently set pool contract
+   */
+  private async fetchPoolFeeFromContract(): Promise<void> {
+    if (!this.poolContract) {
+      throw new Error('Pool contract not initialized');
+    }
+    
+    try {
+      const fee = await this.poolContract.fee();
+      
+      if (this.poolFee !== fee) {
+        console.log(`Updating pool fee: ${this.poolFee} -> ${fee}`);
+        this.poolFee = fee;
+      }
+    } catch (error) {
+      console.error('Error fetching fee from pool contract:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get the current pool fee
+   * @returns The fee as a number
+   */
+  public getPoolFee(): number {
+    return this.poolFee;
+  }
+
+  /**
+   * Set pool fee and update related values
+   * @param fee New fee value
+   */
+  public setPoolFee(fee: number): void {
+    if (fee !== this.poolFee) {
+      console.log(`Setting pool fee: ${this.poolFee} -> ${fee}`);
+      this.poolFee = fee;
+      
+      // Update tick spacing when fee changes
+      this.updateTickSpacingFromFee();
+    }
+  }
+
+  /**
+   * Fetches pool fee from a specific pool address
+   * @param poolAddress The address of the pool to fetch fee from
+   * @returns The pool fee
+   */
+  public async fetchPoolFee(poolAddress: string): Promise<number> {
+    try {
+      // Create temporary pool contract if needed
+      const poolContract = this.poolAddress === poolAddress && this.poolContract 
+        ? this.poolContract
+        : new ethers.Contract(poolAddress, IUniswapV3Pool, this.provider);
+        
+      // Fetch the fee
+      const fee = await poolContract.fee();
+      console.log(`Fetched pool fee from ${poolAddress}: ${fee}`);
+      
+      // Update our internal fee value
+      this.setPoolFee(fee);
+      
+      return fee;
+    } catch (error) {
+      console.error(`Error fetching pool fee from ${poolAddress}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update tick spacing based on current fee
+   */
+  private updateTickSpacingFromFee(): void {
+    // Determine tick spacing based on pool fee
+    if (this.poolFee === 500) {
+      this.tickSpacing = 10; // 0.05% pool
+    } else if (this.poolFee === 3000) {
+      this.tickSpacing = 60; // 0.3% pool
+    } else if (this.poolFee === 10000) {
+      this.tickSpacing = 200; // 1% pool
+    } else {
+      console.warn(`Unknown fee tier: ${this.poolFee}, using default tick spacing of 60`);
+      this.tickSpacing = 60;
+    }
+    console.log(`Updated tick spacing to ${this.tickSpacing} based on fee ${this.poolFee}`);
   }
 
   /**
@@ -119,91 +205,37 @@ export class OracleService {
       // Calculate price = priceX192 * decimalAdjustment / (2^192)
       const denominator = Q96.mul(Q96);
       
-      // Use ethers.js formatting to preserve precision
       let price: number;
       
-      try {
-        // Try to calculate with full precision
-        const numerator = priceX192.mul(decimalAdjustment);
-        const rawPrice = numerator.div(denominator);
-        price = parseFloat(ethers.utils.formatUnits(rawPrice, 0));
-      } catch (err) {
-        console.warn("Precision error in price calculation, falling back to tick-based price");
-        // Fallback to tick-based calculation if we have precision issues
-        price = this.tickToPrice(Number(tick), token0Decimals, token1Decimals);
-      }
-      
-      // Verify if the pool is ETH/USDC or USDC/ETH and adjust the price accordingly
-      const token0IsETH = this.token0?.toLowerCase() === this.config.tokens.ETH?.toLowerCase();
-      if (token0IsETH) {
-        // If token0 is ETH and token1 is USDC, we need to invert the price to get ETH/USDC
-        console.log(`Token0 is ETH, inverting price from ${price} to ${1/price}`);
-        price = 1 / price;
-      }
-  
-      // Sanity check, but don't override
-      if (price > 10000 || price < 0.01) {
-        // Instead of a warning, actually use a safer fallback
-        console.warn(`Calculated price ${price} is outside reasonable range (0.01-10000)`);
-        
-        // If we have a tick, use tick-based price as fallback
-        if (tick) {
-          const fallbackPrice = this.tickToPrice(Number(tick), token0Decimals, token1Decimals);
-          if (token0IsETH) {
-            price = 1 / fallbackPrice;
-          } else {
-            price = fallbackPrice;
-          }
-          console.log(`Using tick-based fallback price: ${price}`);
-        }
-        
-        // Final sanity check - if still unreasonable, use a default
-        if (price > 10000 || price < 0.01) {
-          console.warn(`Fallback price still unreasonable, using default of 1500`);
-          price = 1500;
-        }
-      }
+      // Try to calculate with full precision
+      const numerator = priceX192.mul(decimalAdjustment);
+      const rawPrice = numerator.div(denominator);
+      price = parseFloat(ethers.utils.formatUnits(rawPrice, 0));
   
       return { price, tick: Number(tick) };
     } catch (error) {
-      console.error('Error fetching Uniswap price:', error);
-      throw new Error('Error fetching Uniswap price');
+      throw new Error( `Error fetching Uniswap price: ${error}`);
     }
   }
 
   /**
    * Gets the oracle price from Uniswap
-   * @returns The oracle price data
+   * @returns The oracle price data with current tick
    */
   public async getOraclePrice(): Promise<PriceData> {
     try {
-      const { price: uniswapPrice } = await this.fetchUniswapPrice();
+      const { price: uniswapPrice, tick } = await this.fetchUniswapPrice();
       
       const priceData: PriceData = {
         uniswapPrice: uniswapPrice,
-        timestamp: Math.floor(Date.now() / 1000)
+        timestamp: Math.floor(Date.now() / 1000),
+        tick: tick
       };
 
       this.lastPriceData = priceData;
       return priceData;
     } catch (error) {
-      console.error('Error getting oracle price:', error);
-      
-      // If we have last price data, return it as a fallback
-      if (this.lastPriceData) {
-        console.warn('Using last known price as fallback');
-        return this.lastPriceData;
-      }
-      
-      // No fallback available, return a default price
-      console.warn('No price data available, using default ETH price of 1500 USD');
-      const defaultPrice: PriceData = {
-        uniswapPrice: 1500,
-        timestamp: Math.floor(Date.now() / 1000)
-      };
-      
-      this.lastPriceData = defaultPrice;
-      return defaultPrice;
+      throw new Error();
     }
   }
 
@@ -286,7 +318,8 @@ export class OracleService {
    */
   public async calculateNpcStrategyRange(step: StrategyStep): Promise<PositionRangeParams> {
     const { tick: currentTick, price: currentPrice } = await this.fetchUniswapPrice();
-    const positionStep = this.config.strategy.positionStep;
+    // Use a default position step of 1 instead of accessing a non-existent property
+    const positionStep = 1; // Default to 1 tick spacing unit
     
     let tickLower: number;
     let tickUpper: number;
@@ -337,7 +370,8 @@ export class OracleService {
     }
     
     const [, currentTick, , , , ,] = await this.poolContract.slot0();
-    const maxTickDeviation = this.config.strategy.maxTickDeviation;
+    // Use a default maxTickDeviation of 2 tick spacing units
+    const maxTickDeviation = this.tickSpacing * 2; // Default to 2 tick spacing units
     
     // Check if out of range (basic check)
     const outOfRange = currentTick <= tickLower || currentTick >= tickUpper;
@@ -407,6 +441,74 @@ export class OracleService {
    */
   public getTickSpacing(): number {
     return this.tickSpacing;
+  }
+
+  /**
+   * Validates and adjusts tick ranges for single-sided liquidity positions
+   * @param tickLower Lower tick boundary
+   * @param tickUpper Upper tick boundary
+   * @param isToken0Only True if only token0 (WETH) is being provided
+   * @param isToken1Only True if only token1 (USDC) is being provided
+   * @returns Adjusted tick boundaries that ensure out-of-range positioning
+   */
+  public async validateSingleSidedPosition(
+    tickLower: number,
+    tickUpper: number,
+    isToken0Only: boolean,
+    isToken1Only: boolean
+  ): Promise<{ tickLower: number, tickUpper: number }> {
+    // If not a single-sided position, no adjustment needed
+    if (!isToken0Only && !isToken1Only) {
+      return { tickLower, tickUpper };
+    }
+
+    // Get current tick from the pool
+    const { tick: currentTick } = await this.getCurrentTickAndPrice();
+    console.log(`Validating single-sided position: Current tick ${currentTick}, Range [${tickLower}, ${tickUpper}]`);
+    
+    // For token0-only positions (e.g., WETH only), the position must be entirely ABOVE the current price
+    if (isToken0Only) {
+      // Check if current price is at or above the lower bound
+      if (currentTick >= tickLower) {
+        // Need to adjust the range to be safely above current price
+        // Use a minimal safety buffer to stay close to the current price
+        const safetyBuffer = this.tickSpacing; // Reduced from tickSpacing * 2
+        
+        // Set lower tick just above current tick with minimal buffer
+        const newLower = Math.ceil((currentTick + safetyBuffer) / this.tickSpacing) * this.tickSpacing;
+        
+        // Keep the same range width as originally intended
+        const rangeWidth = tickUpper - tickLower;
+        const newUpper = newLower + rangeWidth;
+        
+        console.log(`WETH-only position: Adjusting range to be just above current price: [${tickLower}, ${tickUpper}] → [${newLower}, ${newUpper}]`);
+        return { tickLower: newLower, tickUpper: newUpper };
+      }
+    }
+    
+    // For token1-only positions (e.g., USDC only), the position must be entirely BELOW the current price
+    if (isToken1Only) {
+      // Check if current price is at or below the upper bound
+      if (currentTick <= tickUpper) {
+        // Need to adjust the range to be safely below current price
+        // Use a minimal safety buffer to stay close to the current price
+        const safetyBuffer = this.tickSpacing; // Reduced from tickSpacing * 2
+        
+        // Set upper tick just below current tick with minimal buffer
+        const newUpper = Math.floor((currentTick - safetyBuffer) / this.tickSpacing) * this.tickSpacing;
+        
+        // Keep the same range width as originally intended
+        const rangeWidth = tickUpper - tickLower;
+        const newLower = newUpper - rangeWidth;
+        
+        console.log(`USDC-only position: Adjusting range to be just below current price: [${tickLower}, ${tickUpper}] → [${newLower}, ${newUpper}]`);
+        return { tickLower: newLower, tickUpper: newUpper };
+      }
+    }
+    
+    // Position is already correctly positioned
+    console.log(`Single-sided position already correctly positioned: [${tickLower}, ${tickUpper}]`);
+    return { tickLower, tickUpper };
   }
 
   /**

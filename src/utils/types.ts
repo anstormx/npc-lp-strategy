@@ -2,43 +2,42 @@ import { BigNumber } from 'ethers';
 
 // Network configuration interface
 export interface NetworkConfig {
-  network?: string;
-  rpcUrl?: string; // Making rpcUrl optional
+  network: string;
+  rpcUrl: string;
   chainId: number;
   tokens: {
     [key: string]: string;
   };
   uniswap: {
-    poolFee: number;
     swapRouter: string;
     positionManager: string; 
     factory: string;
-    feeTiers: number[]; 
-    createPoolIfNeeded?: boolean;
+    poolAddress: string;
   };
   strategy: {
     checkInterval: number;
-    rangeWidthPercent: number;
     slippagePercent: number;
-    binanceSymbol: string;
-    positionStep: number;
-    rebalanceThreshold: number;
-    maxTickDeviation: number;
-    cycleStepDelay: number;
-    dynamicFeeTier: boolean;
+    widthPercent: number;
   };
 }
 
-// Strategy step enum for NPC LP strategy
+// Strategy step enum (kept for compatibility with existing code)
 export enum StrategyStep {
   TOKEN0_TO_TOKEN1 = 'WETH_TO_USDC', // WETH → USDC
   TOKEN1_TO_TOKEN0 = 'USDC_TO_WETH', // USDC → WETH
+}
+
+// Strategy type enum
+export enum StrategyType {
+  CUSTOM = 'CUSTOM',
+  IN_RANGE = 'IN_RANGE'
 }
 
 // Price data from oracle
 export interface PriceData {
   uniswapPrice: number;
   timestamp: number;
+  tick: number; // Current tick from Uniswap V3 pool
 }
 
 // LP Position information
@@ -56,19 +55,19 @@ export interface PositionInfo {
   feeGrowthInside1LastX128?: BigNumber;
   priceLower?: number;
   priceUpper?: number;
-  isActive?: boolean; // Added for active position status
+  isActive?: boolean;
 }
 
-// Rebalance event data
-export interface RebalanceEvent {
-  timestamp: number;
-  action: 'REMOVED_LIQUIDITY' | 'SWAPPED' | 'ADDED_LIQUIDITY';
-  positionId?: number;
-  token0Amount?: BigNumber;
-  token1Amount?: BigNumber;
-  token0Symbol?: string;
-  token1Symbol?: string;
-  price?: number;
+// In-Range strategy positions
+export interface InRangePositions {
+  upper: PositionInfo | null; // Position with higher price range (WETH)
+  lower: PositionInfo | null; // Position with lower price range (USDC)
+}
+
+// Close balances for in-range strategy
+export interface CloseBalances {
+  token0: BigNumber; // WETH
+  token1: BigNumber; // USDC
 }
 
 // Strategy stats interface for tracking performance
@@ -77,93 +76,27 @@ export interface StrategyStats {
   initialToken1Amount: BigNumber;
   currentToken0Amount: BigNumber;
   currentToken1Amount: BigNumber;
-  currentStep: StrategyStep;
   totalVolume: BigNumber;
   totalFeesCollectedToken0: BigNumber;
   totalFeesCollectedToken1: BigNumber;
   cycleCount: number;
-  profitLoss: number; // in basis points
-  currentCycleProfitLoss?: number; // in basis points
+  profitLoss: number;
   startTimestamp: number;
   lastRebalanceTimestamp?: number;
   totalRebalanceCount?: number;
-  currentPositionId?: number;
 }
 
-// 1inch API response for swap
-export interface OneInchSwapResponse {
-  fromToken: {
-    address: string;
-    name: string;
-    symbol: string;
-    decimals: number;
-    logoURI?: string;
-  };
-  toToken: {
-    address: string;
-    name: string;
-    symbol: string;
-    decimals: number;
-    logoURI?: string;
-  };
-  toTokenAmount: string;
-  fromTokenAmount: string;
-  protocols: any[]; // Routing path through various protocols
-  tx: {
-    from: string;
-    to: string;
-    data: string;
-    value: string;
-    gasPrice: string;
-    gas: number;
-  };
-  estimatedGas: number;
+// Position range calculation data (needed for OracleService)
+export interface PositionRangeParams {
+  tickLower: number;
+  tickUpper: number;
+  priceLower: number;
+  priceUpper: number;
+  currentTick: number;
+  currentPrice: number;
 }
 
-// 1inch API response for quote
-export interface OneInchQuoteResponse {
-  fromToken: {
-    address: string;
-    name: string;
-    symbol: string;
-    decimals: number;
-    logoURI?: string;
-  };
-  toToken: {
-    address: string;
-    name: string;
-    symbol: string;
-    decimals: number;
-    logoURI?: string;
-  };
-  toTokenAmount: string;
-  fromTokenAmount: string;
-  protocols: any[]; // Routing path through various protocols
-  estimatedGas: number;
-}
-
-// 1inch API response for approval
-export interface OneInchApproveResponse {
-  address: string;
-  allowance: string;
-}
-
-// 1inch swap parameters
-export interface OneInchSwapParams {
-  fromTokenAddress: string;
-  toTokenAddress: string;
-  amount: string;
-  fromAddress: string;
-  slippage: number;
-  disableEstimate?: boolean;
-  allowPartialFill?: boolean;
-  protocols?: string;
-  destReceiver?: string;
-  referrerAddress?: string;
-  fee?: number;
-}
-
-// Database interfaces to handle BigNumber conversion
+// Database interfaces (needed for DatabaseService)
 export interface DbPositionInfo {
   tickLower: number;
   tickUpper: number;
@@ -181,12 +114,22 @@ export interface DbPositionInfo {
   isActive?: boolean;
 }
 
-export interface DbActionEvent extends Omit<RebalanceEvent, 'token0Amount' | 'token1Amount'> {
+export interface DbActionEvent {
+  type: ActionType;
+  timestamp: number;
+  tokenId?: number;
   token0Amount?: string;
   token1Amount?: string;
+  data?: any;
 }
 
-export interface DbStrategyStats extends Omit<StrategyStats, 'totalFeesCollectedToken0' | 'totalFeesCollectedToken1' | 'initialToken0Amount' | 'initialToken1Amount' | 'currentToken0Amount' | 'currentToken1Amount' | 'totalVolume'> {
+export interface DbStrategyStats {
+  cycleCount: number;
+  profitLoss: number;
+  startTimestamp: number;
+  lastRebalanceTimestamp?: number;
+  totalRebalanceCount?: number;
+  strategyType?: StrategyType;
   totalFeesCollectedToken0: string;
   totalFeesCollectedToken1: string;
   initialToken0Amount: string;
@@ -196,21 +139,30 @@ export interface DbStrategyStats extends Omit<StrategyStats, 'totalFeesCollected
   totalVolumeGenerated: string;
 }
 
-// Position range calculation data
-export interface PositionRangeParams {
-  tickLower: number;
-  tickUpper: number;
-  priceLower: number;
-  priceUpper: number;
-  currentTick: number;
-  currentPrice: number;
+// Action type enum
+export enum ActionType {
+  PRICE_DATA_COLLECTED = 'PRICE_DATA_COLLECTED',
+  POSITION_CREATED = 'POSITION_CREATED',
+  POSITION_CLOSED = 'POSITION_CLOSED',
+  FEES_COLLECTED = 'FEES_COLLECTED',
+  POSITION_OUT_OF_RANGE = 'POSITION_OUT_OF_RANGE',
+  POSITION_CREATION_FAILED = 'POSITION_CREATION_FAILED',
+  POSITION_CLOSE_FAILED = 'POSITION_CLOSE_FAILED',
+  SWAP_FAILED = 'SWAP_FAILED',
+  REBALANCE_FAILED = 'REBALANCE_FAILED',
+  STRAY_POSITION_DETECTED = 'STRAY_POSITION_DETECTED',
+  STRAY_POSITION_CLOSED = 'STRAY_POSITION_CLOSED',
+  STRATEGY_ERROR = 'STRATEGY_ERROR'
 }
 
 // Action types for the strategy
-export type ActionEvent = RebalanceEvent & {
-  type: 'REBALANCE' | 'STEP_CHANGE' | 'CYCLE_COMPLETE'; 
-  step?: StrategyStep;
-  cycleNumber?: number;
+export type ActionEvent = {
+  type: ActionType;
+  timestamp: number;
+  tokenId?: number;
+  token0Amount?: BigNumber;
+  token1Amount?: BigNumber;
+  data?: any;
 };
 
 // Fee tier information
@@ -231,21 +183,3 @@ export interface PoolAnalytics {
   volatility: number; // Price volatility
   utilization: number; // Liquidity utilization
 }
-
-// Pool creation parameters
-export interface PoolCreationParams {
-  token0: string;
-  token1: string;
-  fee: number;
-  sqrtPriceX96: string; // Initial price in sqrtPriceX96 format
-}
-
-// Pool creation result
-export interface PoolCreationResult {
-  poolAddress: string;
-  token0: string;
-  token1: string;
-  fee: number;
-  txHash: string;
-  created: boolean; // True if new pool was created, false if existing pool was used
-} 

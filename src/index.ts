@@ -35,8 +35,6 @@ async function main() {
       mongoUri
     );
 
-    console.log(`NPC LP Strategy for WETH/USDC on Base Mainnet`);
-
     // Initialize services
     await strategy.initialize();
 

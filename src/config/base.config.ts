@@ -17,19 +17,15 @@ const baseMainnet: NetworkConfig = {
     USDC: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   },
   uniswap: {
-    poolFee: 3000, // 0.3%
     swapRouter: '0x2626664c2603336E57B271c5C0b26F421741e481',
     positionManager: '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1',
     factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
-    feeTiers: [500, 3000, 10000],
+    poolAddress: '0x6c561B446416E1A00E8E93E221854d6eA4171372',
   },
   strategy: {
-    checkInterval: 60000, // Check every minute
-    slippagePercent: 0.5,
-    tickRange: 2, // Tick range for NPC LP strategy
-    positionStep: 1,
-    rebalanceThreshold: 0.5,
-    maxTickDeviation: 45,
+    checkInterval: 5000,
+    slippagePercent: 2.5,
+    widthPercent: 20,
   },
 };
 

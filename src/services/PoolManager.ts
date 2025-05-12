@@ -10,8 +10,6 @@ export class PoolManager {
   private provider: ethers.providers.JsonRpcProvider;
   private signer: ethers.Wallet;
   private factoryAddress: string;
-  private feeTiers: number[];
-  private createPoolIfNeeded: boolean;
   private poolFee: number;
 
   constructor(
@@ -21,19 +19,16 @@ export class PoolManager {
     this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
     this.signer = new ethers.Wallet(privateKey, this.provider);
 
-    // Initialize factory address and fee tiers    
+    // Initialize factory address and default fee tier    
     this.factoryAddress = config.uniswap.factory;
-    this.feeTiers = config.uniswap.feeTiers;
-    this.poolFee = config.uniswap.poolFee;
-    this.createPoolIfNeeded = config.uniswap.createPoolIfNeeded || false;
+    // Set default fee to 3000 (0.3%)
+    this.poolFee = 3000;
 
     console.log(`
       --------------------------------
       PoolManager initialized with:
       Factory address: ${this.factoryAddress}
-      Fee tiers: ${this.feeTiers.join(', ')}
       Default fee tier: ${this.poolFee}
-      Create pool if needed: ${this.createPoolIfNeeded}
       --------------------------------
     `);
   }
@@ -42,7 +37,7 @@ export class PoolManager {
    * Gets a pool for a token pair
    * @param token0 First token address
    * @param token1 Second token address
-   * @param feeTier Fee tier (default: from config)
+   * @param feeTier Fee tier (default: from instance variable)
    * @returns Pool address or null if pool doesn't exist
    */
   public async getPool(
@@ -81,47 +76,49 @@ export class PoolManager {
   }
 
   /**
-   * Gets optimal fee tier for a token pair
-   * @param token0 First token address
-   * @param token1 Second token address
-   * @returns The optimal fee tier
+   * Get the current pool fee
+   * @returns The pool fee as a number
    */
-  public async getOptimalFeeTier(
-    token0: string,
-    token1: string
-  ): Promise<number> {
-    console.log(`Finding optimal fee tier for ${token0} - ${token1}`);
+  public getPoolFee(): number {
+    return this.poolFee;
+  }
 
-    // Use the default fee tier to start
-    let optimalFee = this.poolFee;
-    let highestLiquidity = ethers.BigNumber.from(0);
-
-    // Check all fee tiers to find the one with the most liquidity
-    for (const feeTier of this.feeTiers) {
-      try {
-        const poolAddress = await this.getPool(token0, token1, feeTier);
-
-        if (poolAddress) {
-          const pool = new ethers.Contract(
-            poolAddress,
-            IUniswapV3PoolABI,
-            this.provider
-          );
-
-          const liquidity = await pool.liquidity();
-          console.log(`Pool with fee tier ${feeTier} has liquidity: ${liquidity.toString()}`);
-
-          if (liquidity.gt(highestLiquidity)) {
-            highestLiquidity = liquidity;
-            optimalFee = feeTier;
-          }
-        }
-      } catch (error) {
-        console.error(`Error checking fee tier ${feeTier}:`, error);
-      }
+  /**
+   * Sets the pool fee
+   * @param fee New fee value
+   */
+  public setPoolFee(fee: number): void {
+    if (fee !== this.poolFee) {
+      console.log(`Updating pool fee: ${this.poolFee} -> ${fee}`);
+      this.poolFee = fee;
     }
+  }
 
-    console.log(`Optimal fee tier for ${token0} - ${token1} is ${optimalFee}`);
-    return optimalFee;
+  /**
+   * Fetches the pool fee directly from a pool contract
+   * @param poolAddress Address of the Uniswap V3 pool
+   * @returns The fee as a number
+   */
+  public async fetchPoolFee(poolAddress: string): Promise<number> {
+    try {
+      // Create the pool contract
+      const poolContract = new ethers.Contract(
+        poolAddress,
+        IUniswapV3PoolABI,
+        this.provider
+      );
+      
+      // Fetch the fee from the pool
+      const fee = await poolContract.fee();
+      console.log(`Fetched pool fee from contract: ${fee}`);
+      
+      // Update the instance variable
+      this.setPoolFee(fee);
+      
+      return fee;
+    } catch (error) {
+      console.error(`Error fetching pool fee from ${poolAddress}:`, error);
+      throw error;
+    }
   }
 } 
