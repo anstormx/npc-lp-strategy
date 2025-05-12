@@ -2,12 +2,10 @@ import { ethers, BigNumber } from "ethers";
 import {
 	NetworkConfig,
 	StrategyStats,
-	StrategyStep,
 	InRangePositions,
 	CloseBalances,
 	PositionInfo,
 } from "../utils/types";
-import { PoolManager } from "./PoolManager";
 import { LiquidityManager } from "./LiquidityManager";
 import { OracleService } from "./OracleService";
 import { DataTrackingService } from "./DataTrackingService";
@@ -19,17 +17,16 @@ export class CustomPoolStrategy {
 	private provider: ethers.providers.JsonRpcProvider;
 	private signer: ethers.Wallet;
 	private walletAddress: string;
-	private poolManager: PoolManager;
 	private liquidityManager: LiquidityManager;
 	private oracleService: OracleService;
 	private dataTrackingService: DataTrackingService;
 	private swapService: SwapService;
-	private token0: string;
-	private token1: string;
-  private token0Decimals: number = 18;
-  private token1Decimals: number = 18;
-	private token0Contract: ethers.Contract;
-	private token1Contract: ethers.Contract;
+	private token0: string | null = null;
+	private token1: string | null = null;
+	private token0Decimals: number | null = null;
+	private token1Decimals: number | null = null;
+	private token0Contract: ethers.Contract | null = null;
+	private token1Contract: ethers.Contract | null = null;
 	private poolAddress: string;
 	private poolContract: ethers.Contract;
 	private checkInterval: number;
@@ -42,57 +39,33 @@ export class CustomPoolStrategy {
 	};
 	private lastRebalanceSqrtPriceX96: BigNumber = BigNumber.from(0);
 
-	constructor(
-		private config: NetworkConfig,
-		privateKey: string,
-		mongoUri: string
-	) {
+	constructor(private config: NetworkConfig, privateKey: string) {
 		this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
 		this.signer = new ethers.Wallet(privateKey, this.provider);
 		this.walletAddress = this.signer.address;
-		this.token0 = config.tokens.token0;
-		this.token1 = config.tokens.token1;
 		this.checkInterval = config.strategy.checkInterval;
+		this.poolAddress = config.uniswap.poolAddress;
 
 		// Initialize managers
-		this.poolManager = new PoolManager(config, privateKey);
-		this.oracleService = new OracleService(config, privateKey, this.poolManager);
-		this.liquidityManager = new LiquidityManager(
-			config,
-			privateKey,
-			this.oracleService
-		);
+		this.oracleService = new OracleService(config);
+		this.liquidityManager = new LiquidityManager(config, privateKey);
 		this.swapService = new SwapService(config, privateKey);
 
 		// Initialize data tracking service
 		this.dataTrackingService = new DataTrackingService(
 			config,
 			privateKey,
-			mongoUri,
-			"uniswap_strategy",
-			this.checkInterval,
-      this.oracleService
+			config.database.mongoUri,
+			config.database.dbName,
+			this.checkInterval
 		);
 
-		// Initialize token contracts
-		this.token0Contract = new ethers.Contract(
-			this.token0,
-			IERC20ABI,
+		// Initialize pool contract
+		this.poolContract = new ethers.Contract(
+			this.poolAddress,
+			IUniswapV3PoolABI,
 			this.signer
 		);
-		this.token1Contract = new ethers.Contract(
-			this.token1,
-			IERC20ABI,
-			this.signer
-		);
-
-    this.poolAddress = config.uniswap.poolAddress;
-
-    this.poolContract = new ethers.Contract(
-      this.poolAddress,
-      IUniswapV3PoolABI,
-      this.signer
-    );
 
 		// Initialize strategy stats with default values
 		this.stats = {
@@ -123,38 +96,37 @@ export class CustomPoolStrategy {
 	public async initialize(): Promise<void> {
 		console.log("Initializing NPC LP Strategy...");
 
-		// Ensure token order (token0 < token1 in Uniswap V3)
-		const [sortedToken0, sortedToken1] =
-			ethers.utils.getAddress(this.token0) <
-			ethers.utils.getAddress(this.token1)
-				? [this.token0, this.token1]
-				: [this.token1, this.token0];
+		// Fetch token0 and token1 from the pool contract
+		this.token0 = await this.poolContract.token0();
+		this.token1 = await this.poolContract.token1();
 
-		// Apply the sorted token order
-		this.token0 = sortedToken0;
-		this.token1 = sortedToken1;
-		
-		// Update token contracts based on sorted order
+		console.log(`Pool token0: ${this.token0}`);
+		console.log(`Pool token1: ${this.token1}`);
+
+		// Initialize token contracts
 		this.token0Contract = new ethers.Contract(
-			this.token0,
+			this.token0!,
 			IERC20ABI,
 			this.signer
 		);
 		this.token1Contract = new ethers.Contract(
-			this.token1,
+			this.token1!,
 			IERC20ABI,
 			this.signer
 		);
 
-    this.token0Decimals = await this.token0Contract.decimals();
-    this.token1Decimals = await this.token1Contract.decimals();
+		this.token0Decimals = await this.token0Contract.decimals();
+		this.token1Decimals = await this.token1Contract.decimals();
 
-    console.log(`Token0 decimals: ${this.token0Decimals}`);
-    console.log(`Token1 decimals: ${this.token1Decimals}`);
+		console.log(`Token0 decimals: ${this.token0Decimals}`);
+		console.log(`Token1 decimals: ${this.token1Decimals}`);
 
 		await this.liquidityManager.initialize(this.poolContract);
-    await this.oracleService.initialize(this.poolContract);
-		await this.dataTrackingService.initialize(this.poolContract);
+		await this.oracleService.initialize(
+			this.token0Contract,
+			this.token1Contract
+		);
+		await this.dataTrackingService.initialize(this.oracleService);
 		await this.dataTrackingService.startTracking();
 
 		console.log("Data tracking service initialized and started");
@@ -203,22 +175,22 @@ export class CustomPoolStrategy {
 		// Get all user positions
 		const positions = await this.liquidityManager.getUserPositions();
 
-    // if(positions.length == 2) {
-    //   const upperPositionInfo = positions[0];
-    //   const lowerPositionInfo = positions[1];
+		// if(positions.length == 2) {
+		//   const upperPositionInfo = positions[0];
+		//   const lowerPositionInfo = positions[1];
 
-    //   return;
+		//   return;
 
-    //   this.inRangePositions.upper = upperPositionInfo;
-    //   this.inRangePositions.lower = lowerPositionInfo;
-    // }
+		//   this.inRangePositions.upper = upperPositionInfo;
+		//   this.inRangePositions.lower = lowerPositionInfo;
+		// }
 
-    if(positions.length > 0) {
-      throw new Error("Existing positions found, aborting");
-    }
+		// if(positions.length > 0) {
+		//   throw new Error("Existing positions found, aborting");
+		// }
 
-    await this.ensureBalanced5050();
-    await this.rebalanceAndOpenPositions();
+		await this.ensureBalanced5050();
+		await this.rebalanceAndOpenPositions();
 	}
 
 	/**
@@ -237,7 +209,8 @@ export class CustomPoolStrategy {
 		const currentPrice = priceData.uniswapPrice;
 
 		// Calculate USD values
-		const wethValue = parseFloat(ethers.utils.formatEther(wethBalance)) * currentPrice;
+		const wethValue =
+			parseFloat(ethers.utils.formatEther(wethBalance)) * currentPrice;
 		const usdcValue = parseFloat(ethers.utils.formatUnits(usdcBalance, 6));
 
 		const totalValue = wethValue + usdcValue;
@@ -272,26 +245,22 @@ export class CustomPoolStrategy {
 				try {
 					// The SwapService now has built-in retry with adaptive slippage
 					const receipt = await this.swapService.swap(
-						this.token0,
-						this.token1,
+						this.token0!,
+						this.token1!,
 						swapAmountWeth
 					);
 
-					console.log(
-						`Swap completed in tx: ${receipt.transactionHash}`
-					);
+					console.log("Swap completed");
 
 					// Update closeBalances directly instead of querying the chain again
 					this.closeBalances.token0 =
 						this.closeBalances.token0.sub(swapAmountWeth);
 
 					// Get updated balances after swap
-					const actualWethBalance = await this.token0Contract.balanceOf(
-						this.walletAddress
-					);
-					const actualUsdcBalance = await this.token1Contract.balanceOf(
-						this.walletAddress
-					);
+					const actualWethBalance =
+						await this.token0Contract?.balanceOf(this.walletAddress);
+					const actualUsdcBalance =
+						await this.token1Contract?.balanceOf(this.walletAddress);
 
 					// Update closeBalances with the accurate values
 					this.closeBalances.token0 = actualWethBalance;
@@ -324,8 +293,8 @@ export class CustomPoolStrategy {
 				try {
 					// The SwapService now has built-in retry with adaptive slippage
 					const receipt = await this.swapService.swap(
-						this.token1,
-						this.token0,
+						this.token1!,
+						this.token0!,
 						swapAmountUsdc
 					);
 
@@ -338,12 +307,10 @@ export class CustomPoolStrategy {
 						this.closeBalances.token1.sub(swapAmountUsdc);
 
 					// Get updated balances after swap
-					const actualWethBalance = await this.token0Contract.balanceOf(
-						this.walletAddress
-					);
-					const actualUsdcBalance = await this.token1Contract.balanceOf(
-						this.walletAddress
-					);
+					const actualWethBalance =
+						await this.token0Contract?.balanceOf(this.walletAddress);
+					const actualUsdcBalance =
+						await this.token1Contract?.balanceOf(this.walletAddress);
 
 					// Update closeBalances with the accurate values
 					this.closeBalances.token0 = actualWethBalance;
@@ -379,9 +346,7 @@ export class CustomPoolStrategy {
 			const priceData = await this.oracleService.getOraclePrice();
 			const currentPrice = priceData.uniswapPrice;
 
-			console.log(
-				`Current price: ${currentPrice}`
-			);
+			console.log(`Current price: ${currentPrice}`);
 
 			// Get tick spacing
 			const tickSpacing = this.oracleService.getTickSpacing();
@@ -417,9 +382,13 @@ export class CustomPoolStrategy {
 			);
 
 			// Calculate raw ticks using the correct Uniswap V3 formula
-			const upperPositionUpperTick = this.priceToTick(upperPositionUpperPrice);
+			const upperPositionUpperTick = this.priceToTick(
+				upperPositionUpperPrice
+			);
 			const transitionTick = this.priceToTick(transitionPrice);
-			const lowerPositionLowerTick = this.priceToTick(lowerPositionLowerPrice);
+			const lowerPositionLowerTick = this.priceToTick(
+				lowerPositionLowerPrice
+			);
 
 			console.log(
 				`Raw ticks: upper=${upperPositionUpperTick}, transition=${transitionTick}, lower=${lowerPositionLowerTick}`
@@ -492,7 +461,7 @@ export class CustomPoolStrategy {
 			// Calculate total value of tokens
 			const totalToken0 = this.closeBalances.token0;
 			const totalToken1 = this.closeBalances.token1;
-      let totalToken1Left;
+			let totalToken1Left;
 
 			// Calculate value in token1 units (USDC)
 			const totalValueInToken1 = totalToken1.add(
@@ -510,7 +479,6 @@ export class CustomPoolStrategy {
 
 			// Try to create upper position first
 			try {
-
 				console.log(
 					`Minting upper position with ticks [${
 						upperPositionTicks.lower
@@ -519,7 +487,9 @@ export class CustomPoolStrategy {
 					}] using ${ethers.utils.formatEther(
 						totalToken0
 					)} WETH and ${ethers.utils.formatUnits(
-						totalToken1.mul(ethers.utils.parseUnits("10", 4)).div(ethers.utils.parseUnits("100", 4)),
+						totalToken1
+							.mul(ethers.utils.parseUnits("10", 4))
+							.div(ethers.utils.parseUnits("100", 4)),
 						6
 					)} USDC`
 				);
@@ -529,12 +499,12 @@ export class CustomPoolStrategy {
 					upperPositionTicks.upper,
 					totalToken0,
 					totalToken1,
-          totalToken0.mul(98).div(100),
-          BigNumber.from(0)
+					totalToken0.mul(98).div(100),
+					BigNumber.from(0)
 				);
 
-        // usdc left after minting upper position
-        totalToken1Left = totalToken1.sub(upperResult.amount1Used);
+				// usdc left after minting upper position
+				totalToken1Left = totalToken1.sub(upperResult.amount1Used);
 
 				// Get position info and set as upper position
 				const upperPositionInfo =
@@ -564,10 +534,14 @@ export class CustomPoolStrategy {
 					{
 						...upperPositionInfo,
 						priceLower: this.liquidityManager.tickToPrice(
-							upperPositionTicks.lower
+							upperPositionTicks.lower,
+							this.token0Decimals!,
+							this.token1Decimals!
 						),
 						priceUpper: this.liquidityManager.tickToPrice(
-							upperPositionTicks.upper
+							upperPositionTicks.upper,
+							this.token0Decimals!,
+							this.token1Decimals!
 						),
 					}
 				);
@@ -610,8 +584,8 @@ export class CustomPoolStrategy {
 					lowerPositionTicks.upper,
 					BigNumber.from(0),
 					totalToken1Left,
-          BigNumber.from(0),
-          totalToken1Left.mul(98).div(100) // 2% slippage
+					BigNumber.from(0),
+					totalToken1Left.mul(98).div(100) // 2% slippage
 				);
 
 				// Get position info and set as lower position
@@ -642,10 +616,14 @@ export class CustomPoolStrategy {
 					{
 						...lowerPositionInfo,
 						priceLower: this.liquidityManager.tickToPrice(
-							lowerPositionTicks.lower
+							lowerPositionTicks.lower,
+							this.token0Decimals!,
+							this.token1Decimals!
 						),
 						priceUpper: this.liquidityManager.tickToPrice(
-							lowerPositionTicks.upper
+							lowerPositionTicks.upper,
+							this.token0Decimals!,
+							this.token1Decimals!
 						),
 					}
 				);
@@ -703,9 +681,7 @@ export class CustomPoolStrategy {
 			// Set last rebalance price for future threshold checks
 			this.lastRebalancePrice = currentPrice;
 
-			console.log(
-				"Successfully created both positions"
-			);
+			console.log("Successfully created both positions");
 		} catch (error) {
 			console.error("Error in rebalanceAndOpenInRangePositions");
 			throw error;
@@ -730,9 +706,12 @@ export class CustomPoolStrategy {
 			`Last rebalance price: ${this.lastRebalancePrice.toFixed(2)}`
 		);
 
-		const isBeyondTickThreshold = this.isPriceBeyondTickThreshold(currentTick);
+		const isBeyondTickThreshold =
+			this.isPriceBeyondTickThreshold(currentTick);
 
-		console.log(`Is price beyond configured thresholds: ${isBeyondTickThreshold}`);
+		console.log(
+			`Is price beyond configured thresholds: ${isBeyondTickThreshold}`
+		);
 
 		// Check if price change exceeds threshold OR beyond the tick threshold
 		if (isBeyondTickThreshold) {
@@ -987,7 +966,8 @@ export class CustomPoolStrategy {
 		try {
 			// Get current sqrt price from slot0
 			const [currentSqrtPriceX96] = await this.poolContract.slot0();
-			this.lastRebalanceSqrtPriceX96 = BigNumber.from(currentSqrtPriceX96);
+			this.lastRebalanceSqrtPriceX96 =
+				BigNumber.from(currentSqrtPriceX96);
 
 			// Also update the last rebalance price for backward compatibility
 			const priceData = await this.oracleService.getOraclePrice();
@@ -1003,11 +983,15 @@ export class CustomPoolStrategy {
 
 	// Check if the price is beyond the configured thresholds
 	private isPriceBeyondTickThreshold(currentTick: number): boolean {
-    const upperPositionUpper = this.inRangePositions.upper?.tickUpper as number;
-    const lowerPositionLower = this.inRangePositions.lower?.tickLower as number;
+		const upperPositionUpper = this.inRangePositions.upper
+			?.tickUpper as number;
+		const lowerPositionLower = this.inRangePositions.lower
+			?.tickLower as number;
 
-    const upperTickThreshold = upperPositionUpper + 2 * this.oracleService.getTickSpacing();
-    const lowerTickThreshold = lowerPositionLower - 2 * this.oracleService.getTickSpacing();
+		const upperTickThreshold =
+			upperPositionUpper + 2 * this.oracleService.getTickSpacing();
+		const lowerTickThreshold =
+			lowerPositionLower - 2 * this.oracleService.getTickSpacing();
 
 		console.log(
 			`Current tick: ${currentTick}, Upper tick threshold: ${upperTickThreshold}, Lower tick threshold: ${lowerTickThreshold}`
@@ -1045,7 +1029,11 @@ export class CustomPoolStrategy {
 	 * @returns The corresponding tick
 	 */
 	private priceToTick(price: number): number {
-		return (Math.log(price)- (this.token0Decimals - this.token1Decimals) * Math.log(10)) / Math.log(1.0001);
+		return (
+			(Math.log(price) -
+				(this.token0Decimals! - this.token1Decimals!) * Math.log(10)) /
+			Math.log(1.0001)
+		);
 	}
 
 	/**
@@ -1054,7 +1042,10 @@ export class CustomPoolStrategy {
 	 * @returns The corresponding price
 	 */
 	private tickToPrice(tick: number): number {
-		return Math.pow(1.0001, tick) * 10** (this.token0Decimals - this.token1Decimals);
+		return (
+			Math.pow(1.0001, tick) *
+			10 ** (this.token0Decimals! - this.token1Decimals!)
+		);
 	}
 
 	/**
@@ -1069,18 +1060,18 @@ export class CustomPoolStrategy {
 		tickSpacing: number,
 		round: "down" | "up"
 	): number {
-    const remainder = tick % tickSpacing;
-    
-    // If tick is already aligned, return it as is
-    if (remainder === 0) {
-        return tick;
-    }
-    
-    // Round based on the direction (down or up)
-    if (round === "down") {
-        return tick - remainder; // Round down to the previous multiple
-    } else {
-        return tick + (tickSpacing - remainder); // Round up to the next multiple
-    }
+		const remainder = tick % tickSpacing;
+
+		// If tick is already aligned, return it as is
+		if (remainder === 0) {
+			return tick;
+		}
+
+		// Round based on the direction (down or up)
+		if (round === "down") {
+			return tick - remainder; // Round down to the previous multiple
+		} else {
+			return tick + (tickSpacing - remainder); // Round up to the next multiple
+		}
 	}
 }

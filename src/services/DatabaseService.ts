@@ -138,8 +138,8 @@ export class DatabaseService {
       tickLower: position.tickLower,
       tickUpper: position.tickUpper,
       liquidity: position.liquidity.toString(),
-      amount0: position.amount0.toString(),
-      amount1: position.amount1.toString(),
+      amount0: position.amount0?.toString() || '0',
+      amount1: position.amount1?.toString() || '0',
       inRange: position.inRange
     };
     
@@ -220,9 +220,15 @@ export class DatabaseService {
       tickLower: dbPosition.tickLower,
       tickUpper: dbPosition.tickUpper,
       liquidity: BigNumber.from(dbPosition.liquidity),
-      amount0: BigNumber.from(dbPosition.amount0),
-      amount1: BigNumber.from(dbPosition.amount1),
-      inRange: dbPosition.inRange
+      amount0: dbPosition.amount0 ? BigNumber.from(dbPosition.amount0) : undefined,
+      amount1: dbPosition.amount1 ? BigNumber.from(dbPosition.amount1) : undefined,
+      inRange: dbPosition.inRange,
+      tokenId: dbPosition.tokenId || 0,
+      feeGrowthInside0LastX128: dbPosition.feeGrowthInside0 ? BigNumber.from(dbPosition.feeGrowthInside0) : BigNumber.from(0),
+      feeGrowthInside1LastX128: dbPosition.feeGrowthInside1 ? BigNumber.from(dbPosition.feeGrowthInside1) : BigNumber.from(0),
+      priceLower: dbPosition.priceLower || 0,
+      priceUpper: dbPosition.priceUpper || 0,
+      isActive: dbPosition.isActive || false
     };
     
     // Add optional fields if they exist

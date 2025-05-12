@@ -13,48 +13,24 @@ export class LiquidityManager {
 	private signer: ethers.Wallet;
 	private positionManager: Contract;
 	private walletAddress: string;
-	private token0: string;
-	private token1: string;
-	private token0Contract: Contract;
-	private token1Contract: Contract;
-	private poolFee: number;
+	private token0: string | null = null;
+	private token1: string | null = null;
+	private token0Decimals: number | null = null;
+	private token1Decimals: number | null = null;
+	private token0Contract: Contract | null = null;
+	private token1Contract: Contract | null = null;
+	private poolFee: number | null = null;
 	private poolContract: Contract;
-	private oracleService: OracleService | null = null;
 
-	constructor(
-		private config: NetworkConfig,
-		privateKey: string,
-		oracleService: OracleService
-	) {
+	constructor(private config: NetworkConfig, privateKey: string) {
 		this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
 		this.signer = new ethers.Wallet(privateKey, this.provider);
 		this.walletAddress = this.signer.address;
-		this.poolFee = 3000; // Default pool fee
 		this.positionManager = new ethers.Contract(
 			config.uniswap.positionManager,
 			NonfungiblePositionManagerABI,
 			this.signer
 		);
-
-		// Set token addresses as placeholders - will verify order in initialize()
-		this.token0 = config.tokens.WETH;
-		this.token1 = config.tokens.USDC;
-
-		// Initialize token contracts (will update in initialize if needed)
-		this.token0Contract = new ethers.Contract(
-			this.token0,
-			IERC20ABI,
-			this.signer
-		);
-		this.token1Contract = new ethers.Contract(
-			this.token1,
-			IERC20ABI,
-			this.signer
-		);
-
-		// Store oracle service if provided
-		this.oracleService = oracleService;
-
 		this.poolContract = new ethers.Contract(
 			config.uniswap.poolAddress,
 			IUniswapV3PoolABI,
@@ -63,11 +39,7 @@ export class LiquidityManager {
 
 		console.log(`
       --------------------------------
-      Liquidity Manager initialized:
-      Token0: ${this.token0} (placeholder, will verify)
-      Token1: ${this.token1} (placeholder, will verify)
-      Default Pool Fee: ${this.poolFee}
-      Position Manager: ${this.positionManager.address}
+      Liquidity Manager constructor
       --------------------------------
     `);
 	}
@@ -77,81 +49,39 @@ export class LiquidityManager {
 	 * @param poolAddress The address of the pool to use
 	 */
 	public async initialize(poolContract: ethers.Contract): Promise<void> {
-		console.log(`Initializing LiquidityManager`);
-
 		try {
 			// Store the pool contract reference
 			this.poolContract = poolContract;
-
-			// Get actual token0 and token1 from the pool
-			const actualToken0 = await poolContract.token0();
-			const actualToken1 = await poolContract.token1();
-			const actualFee = await poolContract.fee();
+			this.token0 = await poolContract.token0();
+			this.token1 = await poolContract.token1();
+			this.token0Contract = new ethers.Contract(
+				this.token0!,
+				IERC20ABI,
+				this.signer
+			);
+			this.token1Contract = new ethers.Contract(
+				this.token1!,
+				IERC20ABI,
+				this.signer
+			);
+			this.token0Decimals = await this.token0Contract.decimals();
+			this.token1Decimals = await this.token1Contract.decimals();
+			this.poolFee = await poolContract.fee();
 
 			console.log(`
         --------------------------------
-        Pool ${poolContract.address} actual order: 
-        token0: ${actualToken0}
-        token1: ${actualToken1}
-        fee: ${actualFee}
+        LiquidityManager initialized
+        Pool ${poolContract.address} 
+        token0: ${this.token0}
+        token1: ${this.token1}
+        token0 decimals: ${this.token0Decimals}
+        token1 decimals: ${this.token1Decimals}
+        fee: ${this.poolFee}
         --------------------------------
       `);
-
-			// Update our token order to match the pool's order
-			if (
-				ethers.utils.getAddress(this.token0) !==
-					ethers.utils.getAddress(actualToken0) ||
-				ethers.utils.getAddress(this.token1) !==
-					ethers.utils.getAddress(actualToken1)
-			) {
-				console.log("Updating token order to match pool...");
-
-				// Store original values to determine which is which
-				const originalToken0 = this.token0;
-				const originalToken1 = this.token1;
-
-				// Set correct order
-				this.token0 = actualToken0;
-				this.token1 = actualToken1;
-
-				// Update token contracts
-				this.token0Contract = new ethers.Contract(
-					this.token0,
-					IERC20ABI,
-					this.signer
-				);
-				this.token1Contract = new ethers.Contract(
-					this.token1,
-					IERC20ABI,
-					this.signer
-				);
-
-				console.log(`Token order updated:
-          Previous: token0=${originalToken0}, token1=${originalToken1}
-          Current: token0=${this.token0}, token1=${this.token1}
-        `);
-			} else {
-				console.log("Token order already correct, no updates needed");
-			}
-
-			// Update poolFee from the pool contract
-			if (this.poolFee !== actualFee) {
-				console.log(
-					`Updating pool fee: ${this.poolFee} -> ${actualFee}`
-				);
-				this.poolFee = actualFee;
-			}
-
-			console.log(
-				`LiquidityManager successfully initialized with correct token order and fee: ${this.poolFee}`
-			);
 		} catch (error) {
-			console.error("Error initializing LiquidityManager:", error);
-			throw new Error(
-				`Failed to initialize LiquidityManager: ${
-					error instanceof Error ? error.message : "Unknown error"
-				}`
-			);
+			console.error("Error initializing LiquidityManager");
+			throw error;
 		}
 	}
 
@@ -160,41 +90,7 @@ export class LiquidityManager {
 	 * @returns The pool fee as a number
 	 */
 	public getPoolFee(): number {
-		return this.poolFee;
-	}
-
-	/**
-	 * Fetches the pool fee directly from the pool contract
-	 * @param poolAddress Address of the pool contract
-	 * @returns The fee as a number
-	 */
-	public async fetchPoolFee(poolAddress: string): Promise<number> {
-		try {
-			// Create the pool contract if not already initialized
-			if (!this.poolContract) {
-				const poolContract = new ethers.Contract(
-					poolAddress,
-					IUniswapV3PoolABI,
-					this.provider
-				);
-				this.poolContract = poolContract;
-			}
-
-			// Fetch the fee from the pool
-			const fee = await this.poolContract.fee();
-			console.log(`Fetched pool fee from contract: ${fee}`);
-
-			// Update the instance variable
-			this.poolFee = fee;
-
-			return fee;
-		} catch (error) {
-			console.error(
-				`Error fetching pool fee from ${poolAddress}:`,
-				error
-			);
-			throw error;
-		}
+		return this.poolFee!;
 	}
 
 	/**
@@ -207,7 +103,7 @@ export class LiquidityManager {
 		token1Amount: BigNumber
 	): Promise<void> {
 		// Approve token0
-		const allowance0 = await this.token0Contract.allowance(
+		const allowance0 = await this.token0Contract?.allowance(
 			this.walletAddress,
 			this.positionManager.address
 		);
@@ -216,12 +112,9 @@ export class LiquidityManager {
 			console.log(
 				`Approving ${this.positionManager.address} to spend token0...`
 			);
-			const tx0 = await this.token0Contract.approve(
+			const tx0 = await this.token0Contract?.approve(
 				this.positionManager.address,
-				ethers.constants.MaxUint256,
-				{
-					gasLimit: 100000, // Set a high enough gas limit to avoid estimation errors
-				}
+				token0Amount
 			);
 			await tx0.wait();
 			console.log("Token0 approved");
@@ -230,7 +123,7 @@ export class LiquidityManager {
 		}
 
 		// Approve token1
-		const allowance1 = await this.token1Contract.allowance(
+		const allowance1 = await this.token1Contract?.allowance(
 			this.walletAddress,
 			this.positionManager.address
 		);
@@ -239,12 +132,9 @@ export class LiquidityManager {
 			console.log(
 				`Approving ${this.positionManager.address} to spend token1...`
 			);
-			const tx1 = await this.token1Contract.approve(
+			const tx1 = await this.token1Contract?.approve(
 				this.positionManager.address,
-				ethers.constants.MaxUint256,
-				{
-					gasLimit: 100000, // Set a high enough gas limit to avoid estimation errors
-				}
+				token1Amount
 			);
 			await tx1.wait();
 			console.log("Token1 approved");
@@ -281,8 +171,8 @@ export class LiquidityManager {
 			// Approve tokens for position manager
 			await this.approveTokens(amount0Desired, amount1Desired);
 
-			// Set deadline to 20 minutes from now
-			const deadline = Math.floor(Date.now() / 1000) + 1200;
+			// Set deadline to 30 minutes from now
+			const deadline = Math.floor(Date.now() / 1000) + 1800;
 
 			// Create the mint params
 			const params = {
@@ -301,37 +191,37 @@ export class LiquidityManager {
 
 			console.log(
 				`Attempting to mint position with params:`,
-				JSON.stringify({
-					fee: this.poolFee,
-					tickLower,
-					tickUpper,
-					amount0Desired: ethers.utils.formatEther(amount0Desired),
-					amount1Desired: ethers.utils.formatUnits(amount1Desired, 6),
-					amount0Min: ethers.utils.formatEther(amount0Min),
-					amount1Min: ethers.utils.formatUnits(amount1Min, 6),
-					recipient: this.walletAddress,
-					deadline,
-				}, null, 2)
+				JSON.stringify(
+					{
+						fee: this.poolFee,
+						tickLower,
+						tickUpper,
+						amount0Desired:
+							ethers.utils.formatEther(amount0Desired),
+						amount1Desired: ethers.utils.formatUnits(
+							amount1Desired,
+							6
+						),
+						amount0Min: ethers.utils.formatEther(amount0Min),
+						amount1Min: ethers.utils.formatUnits(amount1Min, 6),
+						recipient: this.walletAddress,
+						deadline,
+					},
+					null,
+					2
+				)
 			);
 
 			const tx = await this.positionManager.mint(params);
 			console.log(`Mint transaction hash: ${tx.hash}`);
 
-			// Wait for the transaction to confirm
 			const receipt = await tx.wait();
 
 			try {
-				// More robust event parsing
-				let tokenId: number | undefined;
-
-				// Look through raw logs for the Transfer signature and proper contract address
-				console.log("Looking through logs for Transfer event...");
-
-				// Transfer event signature
 				const transferEventTopic =
 					"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-				// Find log that matches NFT transfer (from 0x0 address)
+				// Find the NFT transfer event
 				const nftTransferLog = receipt.logs.find(
 					(log: any) =>
 						log.address.toLowerCase() ===
@@ -341,19 +231,11 @@ export class LiquidityManager {
 							"0x0000000000000000000000000000000000000000000000000000000000000000"
 				);
 
-				if (nftTransferLog && nftTransferLog.topics.length >= 4) {
-					// NFT tokenId is in the 4th topic (index 3)
-					tokenId = parseInt(nftTransferLog.topics[3], 16);
-					console.log(
-						`Found tokenId ${tokenId} from Transfer log (topic index 3)`
-					);
-				}
-
-				if (!tokenId) {
-					throw new Error(
-						"Failed to determine tokenId from transaction receipt"
-					);
-				}
+				// NFT tokenId is in the 4th topic (index 3)
+				const tokenId = parseInt(nftTransferLog.topics[3], 16);
+				console.log(
+					`Found tokenId ${tokenId} from Transfer log (topic index 3)`
+				);
 
 				console.log(`Position minted with token ID: ${tokenId}`);
 
@@ -363,6 +245,8 @@ export class LiquidityManager {
 
 				const increaseLiquidityTopic =
 					"0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f";
+
+				// Find the IncreaseLiquidity event
 				const increaseLiquidityLog = receipt.logs.find(
 					(log: any) =>
 						log.address.toLowerCase() ===
@@ -370,27 +254,19 @@ export class LiquidityManager {
 						log.topics[0] === increaseLiquidityTopic
 				);
 
-				if (
-					increaseLiquidityLog &&
-					increaseLiquidityLog.data.length > 2
-				) {
-					// Parse the data field - it contains amounts used
-					const decodedData = ethers.utils.defaultAbiCoder.decode(
-						["uint256", "uint256", "uint256"],
-						increaseLiquidityLog.data
-					);
-					amount0Used = decodedData[1];
-					amount1Used = decodedData[2];
-				}
+				// Parse the data field - it contains amounts used
+				const decodedData = ethers.utils.defaultAbiCoder.decode(
+					["uint256", "uint256", "uint256"],
+					increaseLiquidityLog.data
+				);
+				amount0Used = decodedData[1];
+				amount1Used = decodedData[2];
 
-				// Log position stats if we found the amounts
-				if (!amount0Used.isZero() || !amount1Used.isZero()) {
-					console.log(`
+				console.log(`
             Position Created Stats:
             - Amount0 Used: ${ethers.utils.formatEther(amount0Used)} WETH
             - Amount1 Used: ${ethers.utils.formatUnits(amount1Used, 6)} USDC
           `);
-				}
 
 				return { tokenId, amount0Used, amount1Used };
 			} catch (error) {
@@ -410,9 +286,9 @@ export class LiquidityManager {
 	 */
 	public async decreaseLiquidity(
 		tokenId: number,
-		liquidity: BigNumber = BigNumber.from(0),
-		amount0Min: BigNumber = BigNumber.from(0),
-		amount1Min: BigNumber = BigNumber.from(0)
+		liquidity: BigNumber,
+		amount0Min: BigNumber,
+		amount1Min: BigNumber
 	): Promise<{ amount0: BigNumber; amount1: BigNumber }> {
 		try {
 			// Get position info if liquidity not specified
@@ -451,11 +327,13 @@ export class LiquidityManager {
 			// Wait for the transaction to confirm
 			const receipt = await tx.wait();
 
-			// DecreaseLiquidity event signature: 0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4
+			const decreaseLiquidityTopic =
+				"0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4";
+
+			// Find the DecreaseLiquidity event
 			const decreaseLiquidityLog = receipt.logs?.find(
 				(log: any) =>
-					log.topics[0] ===
-						"0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4" &&
+					log.topics[0] === decreaseLiquidityTopic &&
 					log.address.toLowerCase() ===
 						this.positionManager.address.toLowerCase()
 			);
@@ -510,18 +388,20 @@ export class LiquidityManager {
 			// Wait for the transaction to confirm
 			const receipt = await tx.wait();
 
-			// The Collect event signature from the logs: 0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01
+			const collectTopic =
+				"0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01";
+
+			// Find the Collect event
 			const collectLog = receipt.logs?.find(
 				(log: any) =>
-					log.topics[0] ===
-						"0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01" &&
+					log.topics[0] === collectTopic &&
 					log.address.toLowerCase() ===
 						this.positionManager.address.toLowerCase()
 			);
 
 			const decodedData = ethers.utils.defaultAbiCoder.decode(
 				["address", "uint256", "uint256"],
-				collectLog?.data || "0x"
+				collectLog.data
 			);
 
 			const amount0 = decodedData[1];
@@ -545,13 +425,11 @@ export class LiquidityManager {
 			// Burn the position NFT
 			const tx = await this.positionManager.burn(tokenId);
 			console.log(`Burn transaction hash: ${tx.hash}`);
-
-			// Wait for the transaction to confirm
 			await tx.wait();
 
 			console.log(`Position ${tokenId} burned`);
 		} catch (error) {
-			console.error("Error burning position:", error);
+			console.error("Error burning position");
 			throw error;
 		}
 	}
@@ -567,11 +445,20 @@ export class LiquidityManager {
 			const position = await this.positionManager.positions(tokenId);
 
 			// Calculate the price boundaries
-			const priceLower = this.tickToPrice(position.tickLower);
-			const priceUpper = this.tickToPrice(position.tickUpper);
+			const priceLower = this.tickToPrice(
+				position.tickLower,
+				this.token0Decimals!,
+				this.token1Decimals!
+			);
+			const priceUpper = this.tickToPrice(
+				position.tickUpper,
+				this.token0Decimals!,
+				this.token1Decimals!
+			);
 
 			// Check if the position is in range
-			const currentTick = await this.getCurrentTick(); // You'll need to implement this method
+			const [, currentTick] = await this.poolContract.slot0();
+
 			const inRange =
 				position.tickLower <= currentTick &&
 				currentTick <= position.tickUpper;
@@ -581,12 +468,8 @@ export class LiquidityManager {
 				tickLower: position.tickLower,
 				tickUpper: position.tickUpper,
 				liquidity: position.liquidity,
-				amount0: BigNumber.from(0), // Will be calculated later
-				amount1: BigNumber.from(0), // Will be calculated later
 				inRange,
 				tokenId,
-				token0Amount: BigNumber.from(0), // Note: not included in the positions() call
-				token1Amount: BigNumber.from(0), // Note: not included in the positions() call
 				feeGrowthInside0LastX128: position.feeGrowthInside0LastX128,
 				feeGrowthInside1LastX128: position.feeGrowthInside1LastX128,
 				priceLower,
@@ -594,65 +477,8 @@ export class LiquidityManager {
 				isActive: !position.liquidity.isZero(),
 			};
 		} catch (error) {
-			console.error(
-				`Error getting position info for token ${tokenId}:`,
-				error
-			);
+			console.error(`Error getting position info for token ${tokenId}`);
 			throw error;
-		}
-	}
-
-	/**
-	 * Gets the current tick from the pool
-	 * @returns The current tick
-	 */
-	private async getCurrentTick(): Promise<number> {
-		try {
-			// We need to create a pool contract to get the current tick
-			if (!this.token0 || !this.token1) {
-				console.error("Token addresses not set");
-				return 0;
-			}
-
-			// Get the pool address from the factory
-			const factoryAddress = await this.positionManager.factory();
-			const factoryContract = new ethers.Contract(
-				factoryAddress,
-				[
-					"function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)",
-				],
-				this.provider
-			);
-
-			// Get the pool address
-			const poolAddress = await factoryContract.getPool(
-				this.token0,
-				this.token1,
-				this.poolFee
-			);
-
-			if (poolAddress === ethers.constants.AddressZero) {
-				console.error("Pool does not exist");
-				return 0;
-			}
-
-			// Create the pool contract
-			const poolContract = new ethers.Contract(
-				poolAddress,
-				[
-					"function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
-				],
-				this.provider
-			);
-
-			// Call slot0 to get the current tick
-			const [, tick] = await poolContract.slot0();
-
-			console.log(`Current tick from pool: ${tick}`);
-			return Number(tick);
-		} catch (error) {
-			console.error("Error getting current tick:", error);
-			return 0;
 		}
 	}
 
@@ -715,10 +541,11 @@ export class LiquidityManager {
 	 */
 	public tickToPrice(
 		tick: number,
-		token0Decimals = 18,
-		token1Decimals = 6
+		token0Decimals: number,
+		token1Decimals: number
 	): number {
-		const price = Math.pow(1.0001, tick) * 10 ** (token0Decimals - token1Decimals);
+		const price =
+			Math.pow(1.0001, tick) * 10 ** (token0Decimals - token1Decimals);
 		return price;
 	}
 
@@ -746,8 +573,8 @@ export class LiquidityManager {
 
 				const position = await this.getPositionInfo(tokenId);
 
-				console.log(`Position ${i}: ${JSON.stringify(position)}`);
-                
+				// console.log(`Position ${i}: ${JSON.stringify(position, null, 2)}`);
+
 				positions.push(position);
 			}
 

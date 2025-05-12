@@ -2,14 +2,13 @@ import { DatabaseService } from './DatabaseService';
 import { OracleService } from './OracleService';
 import { ActionEvent, ActionType, NetworkConfig, StrategyStats } from '../utils/types';
 import { ethers } from 'ethers';
-import { PoolManager } from './PoolManager';
 
 /**
  * Service that combines Oracle data fetching with Database storage
  * for real-time market tracking and historical analysis
  */
 export class DataTrackingService {
-  private oracleService: OracleService;
+  private oracleService!: OracleService;
   private dbService: DatabaseService;
   private trackingInterval: NodeJS.Timeout | null = null;
   private isTracking: boolean = false;
@@ -22,19 +21,14 @@ export class DataTrackingService {
     mongoUri: string,
     dbName: string = 'uniswap_strategy',
     intervalSeconds: number = 60,
-    oracleService: OracleService
   ) {
     // Initialize services
-    this.oracleService = oracleService;
     this.dbService = new DatabaseService(mongoUri, dbName);
     this.intervalMs = intervalSeconds * 1000;
     
     console.log(`
       --------------------------------
-      Initialized DataTrackingService with:
-        Oracle service: ${oracleService}
-        Database service: ${this.dbService}
-        Interval: ${intervalSeconds}s
+      DataTrackingService constructor
       --------------------------------
     `);
   }
@@ -43,17 +37,15 @@ export class DataTrackingService {
    * Initialize connections to database and blockchain
    * @param poolContract Optional contract to initialize the oracle with
    */
-  public async initialize(poolContract?: ethers.Contract): Promise<void> {
+  public async initialize(oracleService: OracleService): Promise<void> {
     try {
       // Connect to database
       await this.dbService.connect();
       console.log('Database connection established');
       
-      // Initialize oracle if pool contract provided
-      if (poolContract) {
-        await this.oracleService.initialize(poolContract);
-        console.log('Oracle initialized with pool contract');
-      }
+      this.oracleService = oracleService;
+      console.log('Oracle initialized with pool contract');
+      
     } catch (error: any) {
       console.error('Failed to initialize DataTrackingService:', error.message);
       throw new Error(`DataTrackingService initialization failed: ${error.message}`);
