@@ -13,7 +13,7 @@ const baseMainnet: NetworkConfig = {
     poolAddress: '0x6c561B446416E1A00E8E93E221854d6eA4171372',
   },
   strategy: {
-    checkInterval: 5000,
+    checkInterval: 10000,
     widthPercent: 20,
   },
   database: {

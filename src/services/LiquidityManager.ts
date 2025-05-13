@@ -4,6 +4,7 @@ import NonfungiblePositionManagerABI from "../contracts/abis/INonfungiblePositio
 import IERC20ABI from "../contracts/abis/IERC20.json";
 import IUniswapV3PoolABI from "../contracts/abis/IUniswapV3Pool.json";
 import { OracleService } from "./OracleService";
+import { SwapService } from "./SwapService";
 
 /*
  * Service for managing Uniswap V3 liquidity positions
@@ -21,9 +22,30 @@ export class LiquidityManager {
 	private token1Contract: Contract | null = null;
 	private poolFee: number | null = null;
 	private poolContract: Contract;
+	private swapService: SwapService | null = null;
 
-	constructor(private config: NetworkConfig, privateKey: string) {
-		this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
+	// wstETH token address on Base
+	private readonly WSTETH_ADDRESS =
+		"0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"; // Base wstETH address
+
+	// Event topics for transaction parsing
+	private readonly EVENT_TOPICS = {
+		transfer:
+			"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+		increaseLiquidity:
+			"0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f",
+		decreaseLiquidity:
+			"0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4",
+		collect:
+			"0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01",
+	};
+
+	constructor(
+		private config: NetworkConfig,
+		privateKey: string,
+		provider: ethers.providers.JsonRpcProvider
+	) {
+		this.provider = provider;
 		this.signer = new ethers.Wallet(privateKey, this.provider);
 		this.walletAddress = this.signer.address;
 		this.positionManager = new ethers.Contract(
@@ -52,8 +74,14 @@ export class LiquidityManager {
 		try {
 			// Store the pool contract reference
 			this.poolContract = poolContract;
-			this.token0 = await poolContract.token0();
-			this.token1 = await poolContract.token1();
+
+			const [token0, token1] = await Promise.all([
+				poolContract.token0(),
+				poolContract.token1(),
+			]);
+
+			this.token0 = token0;
+			this.token1 = token1;
 			this.token0Contract = new ethers.Contract(
 				this.token0!,
 				IERC20ABI,
@@ -64,9 +92,18 @@ export class LiquidityManager {
 				IERC20ABI,
 				this.signer
 			);
-			this.token0Decimals = await this.token0Contract.decimals();
-			this.token1Decimals = await this.token1Contract.decimals();
-			this.poolFee = await poolContract.fee();
+
+			const [token0Decimals, token1Decimals, poolFee] = await Promise.all(
+				[
+					this.token0Contract.decimals(),
+					this.token1Contract.decimals(),
+					poolContract.fee(),
+				]
+			);
+
+			this.token0Decimals = token0Decimals;
+			this.token1Decimals = token1Decimals;
+			this.poolFee = poolFee;
 
 			console.log(`
         --------------------------------
@@ -94,14 +131,33 @@ export class LiquidityManager {
 	}
 
 	/**
-	 * Approve tokens for the position manager
-	 * @param token0Amount Amount of token0 to approve
-	 * @param token1Amount Amount of token1 to approve
+	 * Get token0 decimals
+	 * @returns The token0 decimals
+	 */
+	public getToken0Decimals(): number {
+		return this.token0Decimals!;
+	}
+
+	/**
+	 * Get token1 decimals
+	 * @returns The token1 decimals
+	 */
+	public getToken1Decimals(): number {
+		return this.token1Decimals!;
+	}
+
+	/**
+	 * Approve tokens for the position manager using the maximum allowance pattern
+	 * @param token0Amount Amount of token0 to approve (for minimum check only)
+	 * @param token1Amount Amount of token1 to approve (for minimum check only)
 	 */
 	private async approveTokens(
 		token0Amount: BigNumber,
 		token1Amount: BigNumber
 	): Promise<void> {
+		// Use MaxUint256 for unlimited approval
+		const MAX_UINT256 = ethers.constants.MaxUint256;
+
 		// Approve token0
 		const allowance0 = await this.token0Contract?.allowance(
 			this.walletAddress,
@@ -110,14 +166,14 @@ export class LiquidityManager {
 
 		if (allowance0.lt(token0Amount)) {
 			console.log(
-				`Approving ${this.positionManager.address} to spend token0...`
+				`Approving ${this.positionManager.address} to spend token0 with maximum allowance...`
 			);
 			const tx0 = await this.token0Contract?.approve(
 				this.positionManager.address,
-				token0Amount
+				MAX_UINT256
 			);
 			await tx0.wait();
-			console.log("Token0 approved");
+			console.log("Token0 approved with maximum allowance");
 		} else {
 			console.log("Token0 already has sufficient allowance");
 		}
@@ -130,17 +186,48 @@ export class LiquidityManager {
 
 		if (allowance1.lt(token1Amount)) {
 			console.log(
-				`Approving ${this.positionManager.address} to spend token1...`
+				`Approving ${this.positionManager.address} to spend token1 with maximum allowance...`
 			);
 			const tx1 = await this.token1Contract?.approve(
 				this.positionManager.address,
-				token1Amount
+				MAX_UINT256
 			);
 			await tx1.wait();
-			console.log("Token1 approved");
+			console.log("Token1 approved with maximum allowance");
 		} else {
 			console.log("Token1 already has sufficient allowance");
 		}
+	}
+
+	/**
+	 * Helper function to find and parse a specific event from a transaction receipt
+	 * @param receipt Transaction receipt
+	 * @param eventTopic The event topic to look for
+	 * @param abiTypes The ABI types to decode the data
+	 * @returns Decoded event data
+	 */
+	private findAndParseEvent<T>(
+		receipt: ethers.ContractReceipt,
+		eventTopic: string,
+		abiTypes: string[]
+	): T {
+		const eventLog = receipt.logs?.find(
+			(log: any) =>
+				log.topics[0] === eventTopic &&
+				log.address.toLowerCase() ===
+					this.positionManager.address.toLowerCase()
+		);
+
+		if (!eventLog) {
+			throw new Error(
+				`Event with topic ${eventTopic} not found in transaction receipt`
+			);
+		}
+
+		return ethers.utils.defaultAbiCoder.decode(
+			abiTypes,
+			eventLog.data
+		) as unknown as T;
 	}
 
 	/**
@@ -196,14 +283,22 @@ export class LiquidityManager {
 						fee: this.poolFee,
 						tickLower,
 						tickUpper,
-						amount0Desired:
-							ethers.utils.formatEther(amount0Desired),
+						amount0Desired: ethers.utils.formatUnits(
+							amount0Desired,
+							this.token0Decimals!
+						),
 						amount1Desired: ethers.utils.formatUnits(
 							amount1Desired,
-							6
+							this.token1Decimals!
 						),
-						amount0Min: ethers.utils.formatEther(amount0Min),
-						amount1Min: ethers.utils.formatUnits(amount1Min, 6),
+						amount0Min: ethers.utils.formatUnits(
+							amount0Min,
+							this.token0Decimals!
+						),
+						amount1Min: ethers.utils.formatUnits(
+							amount1Min,
+							this.token1Decimals!
+						),
 						recipient: this.walletAddress,
 						deadline,
 					},
@@ -218,15 +313,12 @@ export class LiquidityManager {
 			const receipt = await tx.wait();
 
 			try {
-				const transferEventTopic =
-					"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
 				// Find the NFT transfer event
 				const nftTransferLog = receipt.logs.find(
 					(log: any) =>
 						log.address.toLowerCase() ===
 							this.positionManager.address.toLowerCase() &&
-						log.topics[0] === transferEventTopic &&
+						log.topics[0] === this.EVENT_TOPICS.transfer &&
 						log.topics[1] ===
 							"0x0000000000000000000000000000000000000000000000000000000000000000"
 				);
@@ -236,37 +328,25 @@ export class LiquidityManager {
 				console.log(
 					`Found tokenId ${tokenId} from Transfer log (topic index 3)`
 				);
-
 				console.log(`Position minted with token ID: ${tokenId}`);
 
-				// Check for IncreaseLiquidity event to log actual amounts used
-				let amount0Used = BigNumber.from(0);
-				let amount1Used = BigNumber.from(0);
+				// Parse IncreaseLiquidity event
+				const decodedData = this.findAndParseEvent<
+					[BigNumber, BigNumber, BigNumber]
+				>(receipt, this.EVENT_TOPICS.increaseLiquidity, [
+					"uint256",
+					"uint256",
+					"uint256",
+				]);
 
-				const increaseLiquidityTopic =
-					"0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f";
+				const amount0Used = decodedData[1];
+				const amount1Used = decodedData[2];
 
-				// Find the IncreaseLiquidity event
-				const increaseLiquidityLog = receipt.logs.find(
-					(log: any) =>
-						log.address.toLowerCase() ===
-							this.positionManager.address.toLowerCase() &&
-						log.topics[0] === increaseLiquidityTopic
+				this.logTokenAmounts(
+					"Position Created Stats:",
+					amount0Used,
+					amount1Used
 				);
-
-				// Parse the data field - it contains amounts used
-				const decodedData = ethers.utils.defaultAbiCoder.decode(
-					["uint256", "uint256", "uint256"],
-					increaseLiquidityLog.data
-				);
-				amount0Used = decodedData[1];
-				amount1Used = decodedData[2];
-
-				console.log(`
-            Position Created Stats:
-            - Amount0 Used: ${ethers.utils.formatEther(amount0Used)} WETH
-            - Amount1 Used: ${ethers.utils.formatUnits(amount1Used, 6)} USDC
-          `);
 
 				return { tokenId, amount0Used, amount1Used };
 			} catch (error) {
@@ -276,6 +356,24 @@ export class LiquidityManager {
 			console.error("Error minting position");
 			throw error;
 		}
+	}
+
+	/**
+	 * Helper function to log token amounts in a consistent format
+	 * @param label Label for the log
+	 * @param amount0 Amount of token0
+	 * @param amount1 Amount of token1
+	 */
+	private logTokenAmounts(
+		label: string,
+		amount0: BigNumber,
+		amount1: BigNumber
+	): void {
+		console.log(`
+			${label}
+			- Token0: ${ethers.utils.formatUnits(amount0, this.token0Decimals!)}
+			- Token1: ${ethers.utils.formatUnits(amount1, this.token1Decimals!)}
+		`);
 	}
 
 	/**
@@ -327,35 +425,92 @@ export class LiquidityManager {
 			// Wait for the transaction to confirm
 			const receipt = await tx.wait();
 
-			const decreaseLiquidityTopic =
-				"0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4";
-
-			// Find the DecreaseLiquidity event
-			const decreaseLiquidityLog = receipt.logs?.find(
-				(log: any) =>
-					log.topics[0] === decreaseLiquidityTopic &&
-					log.address.toLowerCase() ===
-						this.positionManager.address.toLowerCase()
-			);
-
-			// Decode the data field - format is (uint128 liquidity, uint256 amount0, uint256 amount1)
-			const decodedData = ethers.utils.defaultAbiCoder.decode(
-				["uint128", "uint256", "uint256"],
-				decreaseLiquidityLog.data
-			);
+			// Parse the event to get amounts
+			const decodedData = this.findAndParseEvent<
+				[BigNumber, BigNumber, BigNumber]
+			>(receipt, this.EVENT_TOPICS.decreaseLiquidity, [
+				"uint128",
+				"uint256",
+				"uint256",
+			]);
 
 			const amount0 = decodedData[1];
 			const amount1 = decodedData[2];
 
-			console.log(`Liquidity decreased. Received: 
-        Token0: ${ethers.utils.formatEther(amount0)} WETH
-        Token1: ${ethers.utils.formatUnits(amount1, 6)} USDC
-      `);
+			this.logTokenAmounts(
+				"Liquidity decreased. Received:",
+				amount0,
+				amount1
+			);
 
 			return { amount0, amount1 };
 		} catch (error) {
 			console.error("Error decreasing liquidity:", error);
 			throw error;
+		}
+	}
+
+	/**
+	 * Checks if a position has any uncollected fees without performing a transaction
+	 * @param tokenId ID of the position token
+	 * @returns Boolean indicating if there are any fees to collect and estimated amounts
+	 */
+	public async hasUncollectedFees(
+		tokenId: number
+	): Promise<{ hasFees: boolean; amount0: BigNumber; amount1: BigNumber }> {
+		try {
+			const MAX_UINT128 = BigNumber.from(
+				"0xffffffffffffffffffffffffffffffff"
+			); // 2^128 - 1
+
+			const params = {
+				tokenId,
+				recipient: this.walletAddress,
+				amount0Max: MAX_UINT128,
+				amount1Max: MAX_UINT128,
+			};
+
+			// Use callStatic to simulate the collect call without sending a transaction
+			const result = await this.positionManager.callStatic.collect(
+				params
+			);
+
+			const amount0 = result.amount0 || BigNumber.from(0);
+			const amount1 = result.amount1 || BigNumber.from(0);
+
+			const hasFees = !amount0.isZero() || !amount1.isZero();
+
+			if (hasFees) {
+				console.log(`Position ${tokenId} has uncollected fees:`, {
+					token0: ethers.utils.formatUnits(
+						amount0,
+						this.token0Decimals!
+					),
+					token1: ethers.utils.formatUnits(
+						amount1,
+						this.token1Decimals!
+					),
+				});
+			} else {
+				console.log(`Position ${tokenId} has no uncollected fees`);
+			}
+
+			return {
+				hasFees,
+				amount0,
+				amount1,
+			};
+		} catch (error) {
+			console.error(
+				`Error checking uncollected fees for token ${tokenId}:`,
+				error
+			);
+			// If there's an error, assume there might be fees to be safe
+			return {
+				hasFees: true,
+				amount0: BigNumber.from(0),
+				amount1: BigNumber.from(0),
+			};
 		}
 	}
 
@@ -388,21 +543,14 @@ export class LiquidityManager {
 			// Wait for the transaction to confirm
 			const receipt = await tx.wait();
 
-			const collectTopic =
-				"0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01";
-
-			// Find the Collect event
-			const collectLog = receipt.logs?.find(
-				(log: any) =>
-					log.topics[0] === collectTopic &&
-					log.address.toLowerCase() ===
-						this.positionManager.address.toLowerCase()
-			);
-
-			const decodedData = ethers.utils.defaultAbiCoder.decode(
-				["address", "uint256", "uint256"],
-				collectLog.data
-			);
+			// Parse the event to get fee amounts
+			const decodedData = this.findAndParseEvent<
+				[string, BigNumber, BigNumber]
+			>(receipt, this.EVENT_TOPICS.collect, [
+				"address",
+				"uint256",
+				"uint256",
+			]);
 
 			const amount0 = decodedData[1];
 			const amount1 = decodedData[2];
@@ -437,9 +585,13 @@ export class LiquidityManager {
 	/**
 	 * Gets information about a position
 	 * @param tokenId ID of the position token
+	 * @param currentTick Optional current tick to avoid redundant calls
 	 * @returns Position information
 	 */
-	public async getPositionInfo(tokenId: number): Promise<PositionInfo> {
+	public async getPositionInfo(
+		tokenId: number,
+		currentTick?: number
+	): Promise<PositionInfo> {
 		try {
 			// Get position data from contract
 			const position = await this.positionManager.positions(tokenId);
@@ -457,11 +609,17 @@ export class LiquidityManager {
 			);
 
 			// Check if the position is in range
-			const [, currentTick] = await this.poolContract.slot0();
+			let fetchedTick: number;
+			if (currentTick === undefined) {
+				const [, tick] = await this.poolContract.slot0();
+				fetchedTick = tick;
+			} else {
+				fetchedTick = currentTick;
+			}
 
 			const inRange =
-				position.tickLower <= currentTick &&
-				currentTick <= position.tickUpper;
+				position.tickLower <= fetchedTick &&
+				fetchedTick <= position.tickUpper;
 
 			// Get detailed info about this position
 			return {
@@ -480,6 +638,14 @@ export class LiquidityManager {
 			console.error(`Error getting position info for token ${tokenId}`);
 			throw error;
 		}
+	}
+
+	/**
+	 * Set swap service for token conversions
+	 * @param swapService The swap service instance
+	 */
+	public setSwapService(swapService: SwapService): void {
+		this.swapService = swapService;
 	}
 
 	/**
@@ -502,8 +668,66 @@ export class LiquidityManager {
 				BigNumber.from(0) // min amount 1
 			);
 
-			// Collect any fees
-			const fees = await this.collectFees(tokenId);
+			// Check if there are any fees before collecting
+			const { hasFees } = await this.hasUncollectedFees(tokenId);
+
+			let fees = {
+				amount0: BigNumber.from(0),
+				amount1: BigNumber.from(0),
+			};
+
+			// Only collect fees if there are fees to collect
+			if (hasFees) {
+				console.log(`Position has uncollected fees, collecting...`);
+				fees = await this.collectFees(tokenId);
+
+				if (
+					this.swapService &&
+					(fees.amount0.gt(0) || fees.amount1.gt(0))
+				) {
+					console.log("Converting collected fees to stETH...");
+
+					try {
+						if (fees.amount0.gt(0)) {
+							console.log(
+								`Converting ${ethers.utils.formatUnits(
+									fees.amount0,
+									this.token0Decimals!
+								)} token0 fees to stETH`
+							);
+							await this.swapService.swap(
+								this.token0!,
+								this.WSTETH_ADDRESS,
+								fees.amount0,
+								1 // 1% slippage for fees conversion
+							);
+						}
+
+						if (fees.amount1.gt(0)) {
+							console.log(
+								`Converting ${ethers.utils.formatUnits(
+									fees.amount1,
+									this.token1Decimals!
+								)} token1 fees to stETH`
+							);
+							await this.swapService.swap(
+								this.token1!,
+								this.WSTETH_ADDRESS,
+								fees.amount1,
+								1 // 1% slippage for fees conversion
+							);
+						}
+
+						console.log("Fees successfully converted to stETH");
+					} catch (error) {
+						console.error("Error converting fees to stETH");
+					}
+				}
+			} else {
+				console.log(
+					`Position has no uncollected fees, skipping collection`
+				);
+			}
 
 			// Burn the position NFT
 			await this.burnPosition(tokenId);
@@ -513,14 +737,7 @@ export class LiquidityManager {
 			const totalAmount1 = amount1.add(fees.amount1);
 
 			console.log(`Position closed successfully`);
-			console.log(
-				`Received: ${ethers.utils.formatEther(
-					totalAmount0
-				)} token0 and ${ethers.utils.formatUnits(
-					totalAmount1,
-					6
-				)} token1`
-			);
+			this.logTokenAmounts("Total received:", totalAmount0, totalAmount1);
 
 			return {
 				amount0: totalAmount0,
@@ -553,7 +770,7 @@ export class LiquidityManager {
 	 * Gets all positions owned by the user
 	 * @returns Array of position information
 	 */
-	public async getUserPositions(): Promise<any[]> {
+	public async getUserPositions(): Promise<PositionInfo[]> {
 		console.log(`Getting positions for user: ${this.walletAddress}`);
 
 		try {
@@ -562,8 +779,12 @@ export class LiquidityManager {
 				this.walletAddress
 			);
 
+			// Get current tick once to avoid redundant calls
+			const [, currentTick] = await this.poolContract.slot0();
+			console.log(`Current tick: ${currentTick}`);
+
 			// Get each position token ID
-			const positions = [];
+			const positions: PositionInfo[] = [];
 			for (let i = 0; i < balance; i++) {
 				const tokenId = await this.positionManager.tokenOfOwnerByIndex(
 					this.walletAddress,
@@ -571,10 +792,10 @@ export class LiquidityManager {
 				);
 				console.log(`Found position token ID: ${tokenId}`);
 
-				const position = await this.getPositionInfo(tokenId);
-
-				// console.log(`Position ${i}: ${JSON.stringify(position, null, 2)}`);
-
+				const position = await this.getPositionInfo(
+					tokenId,
+					currentTick
+				);
 				positions.push(position);
 			}
 

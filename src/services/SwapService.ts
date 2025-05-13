@@ -12,7 +12,6 @@ dotenv.config();
 
 // Constants
 const ONEINCH_API_URL = "https://api.1inch.dev/swap/v6.0";
-const ROUTER_ADDRESS = "0x111111125421cA6dc452d289314280a0f8842A65";
 const API_KEY = process.env.ONEINCH_API_KEY as string;
 
 /**
@@ -26,12 +25,10 @@ export class SwapService {
 		"0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 	private apiKey: string = API_KEY;
 	private lastRequestTime: number = 0;
+	private allowanceCache: Map<string, BigNumber> = new Map();
 
-	constructor(private config: NetworkConfig, privateKey: string) {
-		this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl, {
-			chainId: config.chainId,
-			name: config.network,
-		});
+	constructor(private config: NetworkConfig, privateKey: string, provider: ethers.providers.JsonRpcProvider) {
+		this.provider = provider;
 		this.signer = new ethers.Wallet(privateKey, this.provider);
 		this.walletAddress = this.signer.address;
 
@@ -121,6 +118,11 @@ export class SwapService {
 			console.log(`Approval transaction hash: ${tx.hash}`);
 			const receipt = await tx.wait();
 			console.log(`Approval confirmed in block ${receipt.blockNumber}`);
+			
+			// Update the allowance cache with the new approval amount
+			if (amount.eq(ethers.constants.MaxUint256)) {
+				this.allowanceCache.set(tokenAddress.toLowerCase(), ethers.constants.MaxUint256);
+			}
 		} catch (error) {
 			console.error("Error approving token:", error);
 			throw error;
@@ -131,11 +133,20 @@ export class SwapService {
 	 * Checks token allowance for 1inch router
 	 */
 	public async checkAllowance(tokenAddress: string): Promise<BigNumber> {
+		const normalizedAddress = tokenAddress.toLowerCase();
+		
 		// Native ETH doesn't need approval
-		if (this.isNativeETH(tokenAddress)) {
+		if (this.isNativeETH(normalizedAddress)) {
 			return ethers.constants.MaxUint256;
 		}
 
+		// Check if we have a cached unlimited allowance
+		const cachedAllowance = this.allowanceCache.get(normalizedAddress);
+		if (cachedAllowance && cachedAllowance.eq(ethers.constants.MaxUint256)) {
+			console.log(`Using cached unlimited allowance for ${normalizedAddress}`);
+			return cachedAllowance;
+		}
+		
 		try {
 			const allowanceUrl = `${ONEINCH_API_URL}/${this.config.chainId}/approve/allowance`;
 			const response = await this.executeApiRequest<AllowanceResponse>(
@@ -146,13 +157,18 @@ export class SwapService {
 						accept: "application/json",
 					},
 					params: {
-						tokenAddress,
+						tokenAddress: normalizedAddress,
 						walletAddress: this.walletAddress,
 					},
 				}
 			);
 
-			return BigNumber.from(response.data.allowance);
+			const allowance = BigNumber.from(response.data.allowance);
+			
+			// Cache the allowance
+			this.allowanceCache.set(normalizedAddress, allowance);
+			
+			return allowance;
 		} catch (error) {
 			console.error("Error checking allowance:", error);
 			return BigNumber.from(0);
@@ -166,13 +182,22 @@ export class SwapService {
 		tokenAddress: string,
 		amount: BigNumber
 	): Promise<void> {
+		const normalizedAddress = tokenAddress.toLowerCase();
+		
 		// Skip allowance check for native ETH
-		if (this.isNativeETH(tokenAddress)) {
+		if (this.isNativeETH(normalizedAddress)) {
 			return;
 		}
 
 		try {
-			const allowance = await this.checkAllowance(tokenAddress);
+			// Check if we have a cached unlimited allowance first
+			const cachedAllowance = this.allowanceCache.get(normalizedAddress);
+			if (cachedAllowance && cachedAllowance.eq(ethers.constants.MaxUint256)) {
+				console.log(`Token ${normalizedAddress} has unlimited allowance (cached)`);
+				return;
+			}
+			
+			const allowance = await this.checkAllowance(normalizedAddress);
 
 			if (allowance.lt(amount)) {
 				console.log(
@@ -180,17 +205,17 @@ export class SwapService {
 						allowance
 					)}), approving token...`
 				);
-				await this.approveToken(tokenAddress);
+				await this.approveToken(normalizedAddress);
 			} else {
 				console.log(`Sufficient allowance already exists`);
 			}
 		} catch (error) {
 			console.error(
-				`Error ensuring allowance for ${tokenAddress}:`,
+				`Error ensuring allowance for ${normalizedAddress}:`,
 				error
 			);
 			// Still try to approve in case of error
-			await this.approveToken(tokenAddress);
+			await this.approveToken(normalizedAddress);
 		}
 	}
 
@@ -203,8 +228,11 @@ export class SwapService {
 		amount: BigNumber,
 		slippagePercent: number = 2.5
 	): Promise<ethers.providers.TransactionReceipt> {
+		const normalizedFromToken = fromTokenAddress.toLowerCase();
+		const normalizedToToken = toTokenAddress.toLowerCase();
+		
 		console.log(
-			`Swapping tokens with 1inch: from ${fromTokenAddress} to ${toTokenAddress}`
+			`Swapping tokens with 1inch: from ${normalizedFromToken} to ${normalizedToToken}`
 		);
 		console.log(
 			`Amount: ${ethers.utils.formatEther(
@@ -213,19 +241,19 @@ export class SwapService {
 		);
 
 		// Ensure we have approval (skip for native ETH)
-		if (!this.isNativeETH(fromTokenAddress)) {
-			await this.ensureAllowance(fromTokenAddress, amount);
+		if (!this.isNativeETH(normalizedFromToken)) {
+			await this.ensureAllowance(normalizedFromToken, amount);
 		} else {
 			console.log("Swapping native ETH - no approval needed");
 		}
 
 		try {
-			const srcToken = this.isNativeETH(fromTokenAddress)
+			const srcToken = this.isNativeETH(normalizedFromToken)
 				? this.nativeETHAddress
-				: fromTokenAddress;
-			const dstToken = this.isNativeETH(toTokenAddress)
+				: normalizedFromToken;
+			const dstToken = this.isNativeETH(normalizedToToken)
 				? this.nativeETHAddress
-				: toTokenAddress;
+				: normalizedToToken;
 
 			// Get swap transaction data from 1inch API
 			const swapUrl = `${ONEINCH_API_URL}/${this.config.chainId}/swap`;
@@ -257,17 +285,25 @@ export class SwapService {
 				);
 			}
 
-			// Log with safe toString() to avoid formatEther errors with undefined
-			if (swapData.dstAmount) {
+			// Format output amount using correct token decimals
+			if (swapData.dstAmount && swapData.dstToken) {
+				const dstDecimals = swapData.dstToken.decimals || 18;
+				const formattedAmount = ethers.utils.formatUnits(
+					swapData.dstAmount,
+					dstDecimals
+				);
 				console.log(
-					`Expected output amount: ${ethers.utils.formatEther(
-						swapData.dstAmount
-					)}`
+					`Expected output amount: ${formattedAmount} ${swapData.dstToken.symbol}`
+				);
+			} else {
+				// Fallback if token info is not available
+				console.log(
+					`Expected output amount (raw): ${swapData.dstAmount || "unknown"}`
 				);
 			}
 
 			// Set value if sending ETH
-			const value = this.isNativeETH(fromTokenAddress)
+			const value = this.isNativeETH(normalizedFromToken)
 				? amount
 				: BigNumber.from(0);
 

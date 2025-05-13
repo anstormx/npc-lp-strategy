@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "tsc && node dist/index.js"
+    "start": "tsc && node dist/index.js",
+    "close-positions": "tsc && node dist/scripts/closePositions.js"
   },
   "author": "",
   "license": "ISC",

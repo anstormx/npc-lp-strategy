@@ -18,8 +18,8 @@ export class OracleService {
 	private poolFee: number | null = null;
 	private tickSpacing: number | null = null;
 
-	constructor(private config: NetworkConfig) {
-		this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
+	constructor(private config: NetworkConfig, provider: ethers.providers.JsonRpcProvider) {
+		this.provider = provider;
 		this.poolContract = new ethers.Contract(
 			config.uniswap.poolAddress,
 			IUniswapV3Pool,
@@ -33,8 +33,9 @@ export class OracleService {
 	}
 
 	/**
-	 * Initialize the pool contract
-	 * @param poolContract The Uniswap V3 pool contract
+	 * Initialize the oracle service with token contracts
+	 * @param token0Contract The contract for the first token in the pool
+	 * @param token1Contract The contract for the second token in the pool
 	 */
 	public async initialize(
 		token0Contract: Contract,
@@ -42,10 +43,23 @@ export class OracleService {
 	): Promise<void> {
 		this.token0 = token0Contract.address;
 		this.token1 = token1Contract.address;
-		this.token0Decimals = await token0Contract.decimals();
-		this.token1Decimals = await token1Contract.decimals();
-		this.poolFee = await this.poolContract.fee();
-		this.tickSpacing = await this.poolContract.tickSpacing();
+		
+		const [
+			token0Decimals,
+			token1Decimals,
+			poolFee,
+			tickSpacing
+		] = await Promise.all([
+			token0Contract.decimals(),
+			token1Contract.decimals(),
+			this.poolContract.fee(),
+			this.poolContract.tickSpacing()
+		]);
+		
+		this.token0Decimals = token0Decimals;
+		this.token1Decimals = token1Decimals;
+		this.poolFee = poolFee;
+		this.tickSpacing = tickSpacing;
 
 		console.log(`
       --------------------------------
@@ -66,31 +80,15 @@ export class OracleService {
 	 */
 	public async fetchUniswapPrice(): Promise<{ price: number; tick: number }> {
 		try {
-			const [sqrtPriceX96, tick] = await this.poolContract.slot0();
+			const [, tick] = await this.poolContract.slot0();
 			console.log(`Current tick: ${tick}`);
 
-			// Use sqrtPriceX96 for accurate price calculation
-			// The formula is: price = (sqrtPriceX96^2 * 10^(token0Decimals - token1Decimals)) / 2^192
-			const sqrtPriceX96BN = BigNumber.from(sqrtPriceX96);
-			const Q96 = BigNumber.from(2).pow(96);
-
-			// First square the sqrtPrice
-			const priceX192 = sqrtPriceX96BN.mul(sqrtPriceX96BN);
-
-			// Adjust for decimal differences between tokens
-			const decimalAdjustment = BigNumber.from(10).pow(
-				this.token0Decimals! - this.token1Decimals!
-			);
-
-			// Calculate price = priceX192 * decimalAdjustment / (2^192)
-			const denominator = Q96.mul(Q96);
-
-			// Try to calculate with full precision
-			const numerator = priceX192.mul(decimalAdjustment);
-			const rawPrice = numerator.div(denominator);
-			const price = parseFloat(ethers.utils.formatUnits(rawPrice, 0));
-
-			return { price, tick: Number(tick) };
+			const decimalsDiff = this.token0Decimals! - this.token1Decimals!;
+			const tickBasedPrice = Math.pow(1.0001, Number(tick)) * Math.pow(10, decimalsDiff);
+			
+			console.log(`Price from tick: ${tickBasedPrice}`);
+			
+			return { price: tickBasedPrice, tick };
 		} catch (error) {
 			throw new Error(`Error fetching Uniswap price: ${error}`);
 		}

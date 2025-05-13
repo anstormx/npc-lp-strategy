@@ -47,9 +47,9 @@ export class CustomPoolStrategy {
 		this.poolAddress = config.uniswap.poolAddress;
 
 		// Initialize managers
-		this.oracleService = new OracleService(config);
-		this.liquidityManager = new LiquidityManager(config, privateKey);
-		this.swapService = new SwapService(config, privateKey);
+		this.oracleService = new OracleService(config, this.provider);
+		this.liquidityManager = new LiquidityManager(config, privateKey, this.provider);
+		this.swapService = new SwapService(config, privateKey, this.provider);
 
 		// Initialize data tracking service
 		this.dataTrackingService = new DataTrackingService(
@@ -85,8 +85,8 @@ export class CustomPoolStrategy {
 
 		// Set initial close balances
 		this.closeBalances = {
-			token0: BigNumber.from(0), // WETH
-			token1: BigNumber.from(0), // USDC
+			token0: BigNumber.from(0),
+			token1: BigNumber.from(0),
 		};
 	}
 
@@ -129,6 +129,8 @@ export class CustomPoolStrategy {
 		await this.dataTrackingService.initialize(this.oracleService);
 		await this.dataTrackingService.startTracking();
 
+		this.liquidityManager.setSwapService(this.swapService);
+
 		console.log("Data tracking service initialized and started");
 
 		const token0Balance = await this.token0Contract.balanceOf(
@@ -144,14 +146,15 @@ export class CustomPoolStrategy {
 		this.stats.currentToken1Amount = token1Balance;
 
 		console.log(
-			`Initial WETH balance: ${ethers.utils.formatEther(
-				this.stats.initialToken0Amount
+			`Initial token0 balance: ${ethers.utils.formatUnits(
+				this.stats.initialToken0Amount,
+				this.token0Decimals!
 			)}`
 		);
 		console.log(
-			`Initial USDC balance: ${ethers.utils.formatUnits(
+			`Initial token1 balance: ${ethers.utils.formatUnits(
 				this.stats.initialToken1Amount,
-				6
+				this.token1Decimals!
 			)}`
 		);
 
@@ -174,52 +177,113 @@ export class CustomPoolStrategy {
 
 		// Get all user positions
 		const positions = await this.liquidityManager.getUserPositions();
-
-		// if(positions.length == 2) {
-		//   const upperPositionInfo = positions[0];
-		//   const lowerPositionInfo = positions[1];
-
-		//   return;
-
-		//   this.inRangePositions.upper = upperPositionInfo;
-		//   this.inRangePositions.lower = lowerPositionInfo;
-		// }
-
-		// if(positions.length > 0) {
-		//   throw new Error("Existing positions found, aborting");
-		// }
+		
+		// Handle existing positions
+		if (positions.length > 0) {
+			console.log(`Found ${positions.length} existing positions`);
+			
+			// Check if we have exactly 2 positions (our expected upper and lower positions)
+			if (positions.length === 2) {
+				console.log("Found 2 positions, assigning as upper and lower positions");
+				
+				// Sort them by tick range (higher tick range is upper position)
+				const sortedPositions = [...positions].sort(
+					(a, b) => a.tickLower - b.tickLower
+				);
+				
+				const lowerPositionInfo = sortedPositions[0];
+				const upperPositionInfo = sortedPositions[1];
+				
+				// Record these positions
+				this.inRangePositions.lower = lowerPositionInfo;
+				this.inRangePositions.upper = upperPositionInfo;
+				
+				console.log(`Lower position: ${lowerPositionInfo.tokenId}, ticks [${lowerPositionInfo.tickLower}, ${lowerPositionInfo.tickUpper}]`);
+				console.log(`Upper position: ${upperPositionInfo.tokenId}, ticks [${upperPositionInfo.tickLower}, ${upperPositionInfo.tickUpper}]`);
+				
+				return;
+			} else {
+				// Handle stray positions - positions that are not being tracked by the strategy
+				console.log("Found unexpected number of positions, handling as stray positions");
+				await this.handleStrayPositions(positions);
+			}
+		}
 
 		await this.ensureBalanced5050();
 		await this.rebalanceAndOpenPositions();
 	}
 
 	/**
-	 * Ensure we have a balanced 50/50 WETH/USDC allocation
+	 * Handle stray positions that are not being tracked by the strategy
+	 * @param positions List of positions found for the wallet
+	 */
+	private async handleStrayPositions(positions: PositionInfo[]): Promise<void> {
+		for (const position of positions) {
+			console.log(`Processing stray position ${position.tokenId}, ticks [${position.tickLower}, ${position.tickUpper}]`);
+			
+			// Record stray position detected
+			await this.dataTrackingService.recordStrayPositionDetected(
+				position.tokenId,
+				position
+			);
+			
+			// Close the stray position to reclaim funds
+			try {
+				console.log(`Closing stray position ${position.tokenId}...`);
+				const result = await this.liquidityManager.closePosition(position.tokenId);
+				
+				// Record stray position closed
+				await this.dataTrackingService.recordStrayPositionClosed(
+					position.tokenId,
+					result.amount0,
+					result.amount1
+				);
+				
+				// Add to our balances
+				this.closeBalances.token0 = this.closeBalances.token0.add(result.amount0);
+				this.closeBalances.token1 = this.closeBalances.token1.add(result.amount1);
+				
+				console.log(`Stray position ${position.tokenId} closed successfully`);
+				console.log(`Received: ${ethers.utils.formatUnits(result.amount0, this.token0Decimals!)} token0, ${ethers.utils.formatUnits(result.amount1, this.token1Decimals!)} token1`);
+			} catch (error) {
+				console.error(`Error closing stray position ${position.tokenId}:`, error);
+				
+				// Record position close failure
+				await this.dataTrackingService.recordPositionCloseFailed(
+					position.tokenId,
+					error
+				);
+			}
+		}
+	}
+
+	/**
+	 * Ensure we have a balanced 50/50 token0/token1 allocation
 	 * @throws Error if critical rebalancing operations fail
 	 */
 	private async ensureBalanced5050(): Promise<void> {
-		console.log("Checking if we need to rebalance to 50/50 WETH/USDC...");
+		console.log("Checking if we need to rebalance to 50/50 token0/token1...");
 
 		// Get current balances and convert to USD value
-		const wethBalance = this.closeBalances.token0;
-		const usdcBalance = this.closeBalances.token1;
+		const token0Balance = this.closeBalances.token0;
+		const token1Balance = this.closeBalances.token1;
 
 		// Get current price - always fetch fresh price for 50/50 calculation
 		const priceData = await this.oracleService.getOraclePrice();
 		const currentPrice = priceData.uniswapPrice;
 
 		// Calculate USD values
-		const wethValue =
-			parseFloat(ethers.utils.formatEther(wethBalance)) * currentPrice;
-		const usdcValue = parseFloat(ethers.utils.formatUnits(usdcBalance, 6));
+		const token0Value =
+			parseFloat(ethers.utils.formatUnits(token0Balance, this.token0Decimals!)) * currentPrice;
+		const token1Value = parseFloat(ethers.utils.formatUnits(token1Balance, this.token1Decimals!));
 
-		const totalValue = wethValue + usdcValue;
+		const totalValue = token0Value + token1Value;
 		const targetValue = totalValue / 2;
 
 		console.log(
-			`WETH value: $${wethValue.toFixed(
+			`token0 value: $${token0Value.toFixed(
 				2
-			)}, USDC value: $${usdcValue.toFixed(2)}`
+			)}, token1 value: $${token1Value.toFixed(2)}`
 		);
 		console.log(
 			`Total value: $${totalValue.toFixed(
@@ -227,67 +291,64 @@ export class CustomPoolStrategy {
 			)}, Target value per token: $${targetValue.toFixed(2)}`
 		);
 
-		// Check if rebalancing is needed (if difference is more than 10% of total)
-		if (Math.abs(wethValue - usdcValue) / totalValue > 0.1) {
+		if (Math.abs(token0Value - token1Value) / totalValue > 0) {
 			console.log("Rebalancing needed to achieve 50/50 allocation");
 
-			if (wethValue > usdcValue) {
-				// Need to swap WETH to USDC
-				const swapAmountWeth = ethers.utils.parseEther(
-					((wethValue - targetValue) / currentPrice).toFixed(18)
+			if (token0Value > token1Value) {
+				// Need to swap token0 to token1
+				const swapAmountToken0 = ethers.utils.parseUnits(
+					((token0Value - targetValue) / currentPrice).toFixed(this.token0Decimals!),
+					this.token0Decimals!
 				);
 				console.log(
-					`Swapping ${ethers.utils.formatEther(
-						swapAmountWeth
-					)} WETH to USDC...`
+					`Swapping ${ethers.utils.formatUnits(
+						swapAmountToken0,
+						this.token0Decimals!
+					)} token0 to token1...`
 				);
 
 				try {
-					// The SwapService now has built-in retry with adaptive slippage
 					const receipt = await this.swapService.swap(
 						this.token0!,
 						this.token1!,
-						swapAmountWeth
+						swapAmountToken0
 					);
 
 					console.log("Swap completed");
 
-					// Update closeBalances directly instead of querying the chain again
-					this.closeBalances.token0 =
-						this.closeBalances.token0.sub(swapAmountWeth);
-
-					// Get updated balances after swap
-					const actualWethBalance =
+					// Get updated balances after swap - no need to manually subtract first
+					const actualToken0Balance =
 						await this.token0Contract?.balanceOf(this.walletAddress);
-					const actualUsdcBalance =
+					const actualToken1Balance =
 						await this.token1Contract?.balanceOf(this.walletAddress);
 
 					// Update closeBalances with the accurate values
-					this.closeBalances.token0 = actualWethBalance;
-					this.closeBalances.token1 = actualUsdcBalance;
+					this.closeBalances.token0 = actualToken0Balance;
+					this.closeBalances.token1 = actualToken1Balance;
 
 					console.log(
-						`Updated balances: ${ethers.utils.formatEther(
-							this.closeBalances.token0
-						)} WETH, ${ethers.utils.formatUnits(
+						`Updated balances: ${ethers.utils.formatUnits(
+							this.closeBalances.token0,
+							this.token0Decimals!
+						)} token0, ${ethers.utils.formatUnits(
 							this.closeBalances.token1,
-							6
-						)} USDC`
+							this.token1Decimals!
+						)} token1`
 					);
 				} catch (error) {
-					throw new Error(`Error swapping WETH to USDC: ${error}`);
+					throw new Error(`Error swapping token0 to token1: ${error}`);
 				}
 			} else {
-				// Need to swap USDC to WETH
-				const swapAmountUsdc = ethers.utils.parseUnits(
-					(usdcValue - targetValue).toFixed(6),
-					6
+				// Need to swap token1 to token0
+				const swapAmountToken1 = ethers.utils.parseUnits(
+					(token1Value - targetValue).toFixed(this.token1Decimals!),
+					this.token1Decimals!
 				);
 				console.log(
 					`Swapping ${ethers.utils.formatUnits(
-						swapAmountUsdc,
-						6
-					)} USDC to WETH...`
+						swapAmountToken1,
+						this.token1Decimals!
+					)} token1 to token0...`
 				);
 
 				try {
@@ -295,37 +356,34 @@ export class CustomPoolStrategy {
 					const receipt = await this.swapService.swap(
 						this.token1!,
 						this.token0!,
-						swapAmountUsdc
+						swapAmountToken1
 					);
 
 					console.log(
 						`Swap completed in tx: ${receipt.transactionHash}`
 					);
 
-					// Update closeBalances directly instead of querying the chain again
-					this.closeBalances.token1 =
-						this.closeBalances.token1.sub(swapAmountUsdc);
-
-					// Get updated balances after swap
-					const actualWethBalance =
+					// Get updated balances after swap - no need to manually subtract first
+					const actualToken0Balance =
 						await this.token0Contract?.balanceOf(this.walletAddress);
-					const actualUsdcBalance =
+					const actualToken1Balance =
 						await this.token1Contract?.balanceOf(this.walletAddress);
 
 					// Update closeBalances with the accurate values
-					this.closeBalances.token0 = actualWethBalance;
-					this.closeBalances.token1 = actualUsdcBalance;
+					this.closeBalances.token0 = actualToken0Balance;
+					this.closeBalances.token1 = actualToken1Balance;
 
 					console.log(
-						`Updated balances: ${ethers.utils.formatEther(
-							this.closeBalances.token0
-						)} WETH, ${ethers.utils.formatUnits(
+						`Updated balances: ${ethers.utils.formatUnits(
+							this.closeBalances.token0,
+							this.token0Decimals!
+						)} token0, ${ethers.utils.formatUnits(
 							this.closeBalances.token1,
-							6
-						)} USDC`
+							this.token1Decimals!
+						)} token1`
 					);
 				} catch (error) {
-					throw new Error(`Error swapping USDC to WETH: ${error}`);
+					throw new Error(`Error swapping token1 to token0: ${error}`);
 				}
 			}
 		} else {
@@ -400,17 +458,17 @@ export class CustomPoolStrategy {
 			const alignedUpperPositionUpperTick = this.alignTick(
 				upperPositionUpperTick,
 				tickSpacing,
-				"up"
+				true // Round up
 			);
 			const alignedTransitionTick = this.alignTick(
 				transitionTick,
 				tickSpacing,
-				"down"
-			); // Use down for cleaner boundary
+				false // Round down for cleaner boundary
+			);
 			const alignedLowerPositionLowerTick = this.alignTick(
 				lowerPositionLowerTick,
 				tickSpacing,
-				"down"
+				false // Round down
 			);
 
 			console.log(
@@ -418,13 +476,13 @@ export class CustomPoolStrategy {
 			);
 
 			// Create position tick ranges
-			// Lower position: USDC only, from lower bound to transition point
+			// Lower position: token1 only, from lower bound to transition point
 			const lowerPositionTicks = {
 				lower: alignedLowerPositionLowerTick,
 				upper: alignedTransitionTick,
 			};
 
-			// Upper position: WETH only, from transition point to upper bound
+			// Upper position: token0 only, from transition point to upper bound
 			const upperPositionTicks = {
 				lower: alignedTransitionTick,
 				upper: alignedUpperPositionUpperTick,
@@ -443,13 +501,13 @@ export class CustomPoolStrategy {
 
 			console.log(`===== Position Configuration =====`);
 			console.log(
-				`Lower position (USDC only): Price range ${alignedLowerPositionLowerPrice} to ${alignedTransitionPrice}`
+				`Lower position (token1 only): Price range ${alignedLowerPositionLowerPrice} to ${alignedTransitionPrice}`
 			);
 			console.log(
 				`Lower position: Tick range [${lowerPositionTicks.lower}, ${lowerPositionTicks.upper}]`
 			);
 			console.log(
-				`Upper position (WETH only): Price range ${alignedTransitionPrice} to ${alignedUpperPositionUpperPrice}`
+				`Upper position (token0 only): Price range ${alignedTransitionPrice} to ${alignedUpperPositionUpperPrice}`
 			);
 			console.log(
 				`Upper position: Tick range [${upperPositionTicks.lower}, ${upperPositionTicks.upper}]`
@@ -463,17 +521,17 @@ export class CustomPoolStrategy {
 			const totalToken1 = this.closeBalances.token1;
 			let totalToken1Left;
 
-			// Calculate value in token1 units (USDC)
+			// Calculate value in token1 units (token0)
 			const totalValueInToken1 = totalToken1.add(
 				totalToken0
-					.mul(BigNumber.from(Math.floor(currentPrice * 1e6)))
-					.div(BigNumber.from(10).pow(18))
+					.mul(BigNumber.from(Math.floor(currentPrice * Math.pow(10, this.token1Decimals!))))
+					.div(BigNumber.from(10).pow(this.token0Decimals!))
 			);
 
 			console.log(
 				`Total value: $${ethers.utils.formatUnits(
 					totalValueInToken1,
-					6
+					this.token1Decimals!
 				)}`
 			);
 
@@ -484,14 +542,13 @@ export class CustomPoolStrategy {
 						upperPositionTicks.lower
 					}, ${
 						upperPositionTicks.upper
-					}] using ${ethers.utils.formatEther(
-						totalToken0
-					)} WETH and ${ethers.utils.formatUnits(
-						totalToken1
-							.mul(ethers.utils.parseUnits("10", 4))
-							.div(ethers.utils.parseUnits("100", 4)),
-						6
-					)} USDC`
+					}] using ${ethers.utils.formatUnits(
+						totalToken0,
+						this.token0Decimals!
+					)} token0 and ${ethers.utils.formatUnits(
+						totalToken1,
+						this.token1Decimals!
+					)} token1`
 				);
 
 				const upperResult = await this.liquidityManager.mintPosition(
@@ -503,7 +560,7 @@ export class CustomPoolStrategy {
 					BigNumber.from(0)
 				);
 
-				// usdc left after minting upper position
+				// token1 left after minting upper position
 				totalToken1Left = totalToken1.sub(upperResult.amount1Used);
 
 				// Get position info and set as upper position
@@ -520,12 +577,13 @@ export class CustomPoolStrategy {
 					`Upper position created with token ID: ${upperResult.tokenId}`
 				);
 				console.log(
-					`Actual amounts used: ${ethers.utils.formatEther(
-						upperResult.amount0Used
-					)} WETH, ${ethers.utils.formatUnits(
+					`Actual amounts used: ${ethers.utils.formatUnits(
+						upperResult.amount0Used,
+						this.token0Decimals!
+					)} token0, ${ethers.utils.formatUnits(
 						upperResult.amount1Used,
-						6
-					)} USDC`
+						this.token1Decimals!
+					)} token1`
 				);
 
 				// Record this position creation in the tracking system
@@ -571,12 +629,13 @@ export class CustomPoolStrategy {
 						lowerPositionTicks.lower
 					}, ${
 						lowerPositionTicks.upper
-					}] using ${ethers.utils.formatEther(
-						0
-					)} WETH and ${ethers.utils.formatUnits(
+					}] using ${ethers.utils.formatUnits(
+						0,
+						this.token0Decimals!
+					)} token0 and ${ethers.utils.formatUnits(
 						totalToken1Left,
-						6
-					)} USDC`
+						this.token1Decimals!
+					)} token1`
 				);
 
 				const lowerResult = await this.liquidityManager.mintPosition(
@@ -602,12 +661,13 @@ export class CustomPoolStrategy {
 					`Lower position created with token ID: ${lowerResult.tokenId}`
 				);
 				console.log(
-					`Actual amounts used: ${ethers.utils.formatEther(
-						lowerResult.amount0Used
-					)} WETH, ${ethers.utils.formatUnits(
+					`Actual amounts used: ${ethers.utils.formatUnits(
+						lowerResult.amount0Used,
+						this.token0Decimals!
+					)} token0, ${ethers.utils.formatUnits(
 						lowerResult.amount1Used,
-						6
-					)} USDC`
+						this.token1Decimals!
+					)} token1`
 				);
 
 				// Record this position creation in the tracking system
@@ -713,7 +773,6 @@ export class CustomPoolStrategy {
 			`Is price beyond configured thresholds: ${isBeyondTickThreshold}`
 		);
 
-		// Check if price change exceeds threshold OR beyond the tick threshold
 		if (isBeyondTickThreshold) {
 			console.log(`Closing positions and rebalancing`);
 
@@ -758,12 +817,27 @@ export class CustomPoolStrategy {
 							);
 
 						console.log(
-							`Lower position fees collected: ${ethers.utils.formatEther(
-								lowerFees.amount0
-							)} WETH, ${ethers.utils.formatUnits(
+							`Lower position fees collected: ${ethers.utils.formatUnits(
+								lowerFees.amount0,
+								this.token0Decimals!
+							)} token0, ${ethers.utils.formatUnits(
 								lowerFees.amount1,
-								6
-							)} USDC`
+								this.token1Decimals!
+							)} token1`
+						);
+
+						// Record position closed event
+						await this.dataTrackingService.recordPositionClosed(
+							lowerTokenId,
+							lowerResult.amount0,
+							lowerResult.amount1
+						);
+
+						// Record fees collected event
+						await this.dataTrackingService.recordFeesCollected(
+							lowerTokenId,
+							lowerFees.amount0,
+							lowerFees.amount1
 						);
 
 						// Update balances
@@ -802,12 +876,27 @@ export class CustomPoolStrategy {
 							);
 
 						console.log(
-							`Upper position fees collected: ${ethers.utils.formatEther(
-								upperFees.amount0
-							)} WETH, ${ethers.utils.formatUnits(
+							`Upper position fees collected: ${ethers.utils.formatUnits(
+								upperFees.amount0,
+								this.token0Decimals!
+							)} token0, ${ethers.utils.formatUnits(
 								upperFees.amount1,
-								6
-							)} USDC`
+								this.token1Decimals!
+							)} token1`
+						);
+
+						// Record position closed event
+						await this.dataTrackingService.recordPositionClosed(
+							upperTokenId,
+							upperResult.amount0,
+							upperResult.amount1
+						);
+
+						// Record fees collected event
+						await this.dataTrackingService.recordFeesCollected(
+							upperTokenId,
+							upperFees.amount0,
+							upperFees.amount1
 						);
 
 						// Update balances
@@ -819,20 +908,22 @@ export class CustomPoolStrategy {
 				}
 
 				console.log(
-					`Positions closed, total balances: ${ethers.utils.formatEther(
-						this.closeBalances.token0
-					)} WETH, ${ethers.utils.formatUnits(
+					`Positions closed, total balances: ${ethers.utils.formatUnits(
+						this.closeBalances.token0,
+						this.token0Decimals!
+					)} token0, ${ethers.utils.formatUnits(
 						this.closeBalances.token1,
-						6
-					)} USDC`
+						this.token1Decimals!
+					)} token1`
 				);
 				console.log(
-					`Total fees collected: ${ethers.utils.formatEther(
-						this.stats.totalFeesCollectedToken0
-					)} WETH, ${ethers.utils.formatUnits(
+					`Total fees collected: ${ethers.utils.formatUnits(
+						this.stats.totalFeesCollectedToken0,
+						this.token0Decimals!
+					)} token0, ${ethers.utils.formatUnits(
 						this.stats.totalFeesCollectedToken1,
-						6
-					)} USDC`
+						this.token1Decimals!
+					)} token1`
 				);
 
 				// Update rebalance stats
@@ -884,14 +975,22 @@ export class CustomPoolStrategy {
 		const principal1 = position.token1Amount || BigNumber.from(0);
 
 		console.log(
-			`Position principal amounts: ${ethers.utils.formatEther(
-				principal0
-			)} WETH, ${ethers.utils.formatUnits(principal1, 6)} USDC`
+			`Position principal amounts: ${ethers.utils.formatUnits(
+				principal0,
+				this.token0Decimals!
+			)} token0, ${ethers.utils.formatUnits(
+				principal1,
+				this.token1Decimals!
+			)} token1`
 		);
 		console.log(
-			`Amount received: ${ethers.utils.formatEther(
-				amount0Received
-			)} WETH, ${ethers.utils.formatUnits(amount1Received, 6)} USDC`
+			`Amount received: ${ethers.utils.formatUnits(
+				amount0Received,
+				this.token0Decimals!
+			)} token0, ${ethers.utils.formatUnits(
+				amount1Received,
+				this.token1Decimals!
+			)} token1`
 		);
 
 		// Calculate fees (anything above principal is considered fees)
@@ -905,9 +1004,13 @@ export class CustomPoolStrategy {
 			: BigNumber.from(0);
 
 		console.log(
-			`Calculated fees: ${ethers.utils.formatEther(
-				fees0
-			)} WETH, ${ethers.utils.formatUnits(fees1, 6)} USDC`
+			`Calculated fees: ${ethers.utils.formatUnits(
+				fees0,
+				this.token0Decimals!
+			)} token0, ${ethers.utils.formatUnits(
+				fees1,
+				this.token1Decimals!
+			)} token1`
 		);
 
 		return {
@@ -1052,26 +1155,19 @@ export class CustomPoolStrategy {
 	 * Align tick to the nearest tickSpacing
 	 * @param tick The tick to align
 	 * @param tickSpacing The tick spacing
-	 * @param round Whether to round up or down
+	 * @param roundUp Whether to round up or down
 	 * @returns The aligned tick
 	 */
 	private alignTick(
 		tick: number,
 		tickSpacing: number,
-		round: "down" | "up"
+		roundUp: boolean
 	): number {
-		const remainder = tick % tickSpacing;
-
-		// If tick is already aligned, return it as is
-		if (remainder === 0) {
-			return tick;
-		}
-
-		// Round based on the direction (down or up)
-		if (round === "down") {
-			return tick - remainder; // Round down to the previous multiple
-		} else {
-			return tick + (tickSpacing - remainder); // Round up to the next multiple
-		}
+		// Use the LiquidityManager's implementation which handles negative ticks correctly
+		return this.liquidityManager.alignTickToSpacing(
+			tick,
+			tickSpacing,
+			roundUp
+		);
 	}
 }
